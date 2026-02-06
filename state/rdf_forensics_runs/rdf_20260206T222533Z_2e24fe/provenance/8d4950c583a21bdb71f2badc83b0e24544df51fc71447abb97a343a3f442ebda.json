@@ -1,0 +1,24 @@
+{
+  "digest": "8d4950c583a21bdb71f2badc83b0e24544df51fc71447abb97a343a3f442ebda",
+  "retrieved_at": "2026-02-06T22:25:33.375191+00:00",
+  "source": {
+    "original_url": "file:///Users/eddie/Documents/textdocs/business_plan.md",
+    "snapshot_timestamp": null,
+    "retrieval_url": "file:///Users/eddie/Documents/textdocs/business_plan.md"
+  },
+  "http": {
+    "status": 200,
+    "content_type": "text/markdown",
+    "content_length": 4198
+  },
+  "file": {
+    "path": "/Users/eddie/Documents/textdocs/business_plan.md",
+    "bytes": 4198,
+    "sha256": "8d4950c583a21bdb71f2badc83b0e24544df51fc71447abb97a343a3f442ebda",
+    "sha256_postcheck": "8d4950c583a21bdb71f2badc83b0e24544df51fc71447abb97a343a3f442ebda"
+  },
+  "parse": {
+    "detected_format": "unknown",
+    "parse_ok": true
+  }
+}

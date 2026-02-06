@@ -1,0 +1,24 @@
+{
+  "digest": "38eb2e0847a1b349d2099cd01012518f60771412b8c9feee12dd70a07b0dd806",
+  "retrieved_at": "2026-02-06T22:25:33.375847+00:00",
+  "source": {
+    "original_url": "file:///Users/eddie/Documents/textdocs/future_specs/background_consultation_mvp_v0.1.1.md",
+    "snapshot_timestamp": null,
+    "retrieval_url": "file:///Users/eddie/Documents/textdocs/future_specs/background_consultation_mvp_v0.1.1.md"
+  },
+  "http": {
+    "status": 200,
+    "content_type": "text/markdown",
+    "content_length": 6757
+  },
+  "file": {
+    "path": "/Users/eddie/Documents/textdocs/future_specs/background_consultation_mvp_v0.1.1.md",
+    "bytes": 6757,
+    "sha256": "38eb2e0847a1b349d2099cd01012518f60771412b8c9feee12dd70a07b0dd806",
+    "sha256_postcheck": "38eb2e0847a1b349d2099cd01012518f60771412b8c9feee12dd70a07b0dd806"
+  },
+  "parse": {
+    "detected_format": "unknown",
+    "parse_ok": true
+  }
+}

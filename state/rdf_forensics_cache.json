@@ -1,0 +1,110 @@
+{
+  "61c1e3e1f5719e60f7789fab64cd38f21df03a365f9f702e433c903dec9d4640": {
+    "run_id": "rdf_20260206T222533Z_2e24fe",
+    "provenance": [
+      {
+        "digest": "8d4950c583a21bdb71f2badc83b0e24544df51fc71447abb97a343a3f442ebda",
+        "retrieved_at": "2026-02-06T22:25:33.375191+00:00",
+        "source": {
+          "original_url": "file:///Users/eddie/Documents/textdocs/business_plan.md",
+          "snapshot_timestamp": null,
+          "retrieval_url": "file:///Users/eddie/Documents/textdocs/business_plan.md"
+        },
+        "http": {
+          "status": 200,
+          "content_type": "text/markdown",
+          "content_length": 4198
+        },
+        "file": {
+          "path": "/Users/eddie/Documents/textdocs/business_plan.md",
+          "bytes": 4198,
+          "sha256": "8d4950c583a21bdb71f2badc83b0e24544df51fc71447abb97a343a3f442ebda",
+          "sha256_postcheck": "8d4950c583a21bdb71f2badc83b0e24544df51fc71447abb97a343a3f442ebda"
+        },
+        "parse": {
+          "detected_format": "unknown",
+          "parse_ok": true
+        }
+      },
+      {
+        "digest": "1d2a4cc6030d6e895e72d2ddc867092abf59ad9f3ab40c719d916febec376a33",
+        "retrieved_at": "2026-02-06T22:25:33.375544+00:00",
+        "source": {
+          "original_url": "file:///Users/eddie/Documents/textdocs/background_consultation_mvp.md",
+          "snapshot_timestamp": null,
+          "retrieval_url": "file:///Users/eddie/Documents/textdocs/background_consultation_mvp.md"
+        },
+        "http": {
+          "status": 200,
+          "content_type": "text/markdown",
+          "content_length": 8339
+        },
+        "file": {
+          "path": "/Users/eddie/Documents/textdocs/background_consultation_mvp.md",
+          "bytes": 8339,
+          "sha256": "1d2a4cc6030d6e895e72d2ddc867092abf59ad9f3ab40c719d916febec376a33",
+          "sha256_postcheck": "1d2a4cc6030d6e895e72d2ddc867092abf59ad9f3ab40c719d916febec376a33"
+        },
+        "parse": {
+          "detected_format": "unknown",
+          "parse_ok": true
+        }
+      },
+      {
+        "digest": "aa32d8ee453648a944a87f5bdef54574bf5c587fb434cfb453584207c2157017",
+        "retrieved_at": "2026-02-06T22:25:33.375716+00:00",
+        "source": {
+          "original_url": "file:///Users/eddie/Documents/textdocs/future_specs/business_plan_v0.1.md",
+          "snapshot_timestamp": null,
+          "retrieval_url": "file:///Users/eddie/Documents/textdocs/future_specs/business_plan_v0.1.md"
+        },
+        "http": {
+          "status": 200,
+          "content_type": "text/markdown",
+          "content_length": 3415
+        },
+        "file": {
+          "path": "/Users/eddie/Documents/textdocs/future_specs/business_plan_v0.1.md",
+          "bytes": 3415,
+          "sha256": "aa32d8ee453648a944a87f5bdef54574bf5c587fb434cfb453584207c2157017",
+          "sha256_postcheck": "aa32d8ee453648a944a87f5bdef54574bf5c587fb434cfb453584207c2157017"
+        },
+        "parse": {
+          "detected_format": "unknown",
+          "parse_ok": true
+        }
+      },
+      {
+        "digest": "38eb2e0847a1b349d2099cd01012518f60771412b8c9feee12dd70a07b0dd806",
+        "retrieved_at": "2026-02-06T22:25:33.375847+00:00",
+        "source": {
+          "original_url": "file:///Users/eddie/Documents/textdocs/future_specs/background_consultation_mvp_v0.1.1.md",
+          "snapshot_timestamp": null,
+          "retrieval_url": "file:///Users/eddie/Documents/textdocs/future_specs/background_consultation_mvp_v0.1.1.md"
+        },
+        "http": {
+          "status": 200,
+          "content_type": "text/markdown",
+          "content_length": 6757
+        },
+        "file": {
+          "path": "/Users/eddie/Documents/textdocs/future_specs/background_consultation_mvp_v0.1.1.md",
+          "bytes": 6757,
+          "sha256": "38eb2e0847a1b349d2099cd01012518f60771412b8c9feee12dd70a07b0dd806",
+          "sha256_postcheck": "38eb2e0847a1b349d2099cd01012518f60771412b8c9feee12dd70a07b0dd806"
+        },
+        "parse": {
+          "detected_format": "unknown",
+          "parse_ok": true
+        }
+      }
+    ],
+    "outputs": {
+      "run_dir": "/Users/eddie/Documents/axeon-multi-llm-orchestrator/state/rdf_forensics_runs/rdf_20260206T222533Z_2e24fe",
+      "summary_json": "/Users/eddie/Documents/axeon-multi-llm-orchestrator/state/rdf_forensics_runs/rdf_20260206T222533Z_2e24fe/summary.json",
+      "report_md": "/Users/eddie/Documents/axeon-multi-llm-orchestrator/state/rdf_forensics_runs/rdf_20260206T222533Z_2e24fe/report.md",
+      "claims_nq_gz": "/Users/eddie/Documents/axeon-multi-llm-orchestrator/state/rdf_forensics_runs/rdf_20260206T222533Z_2e24fe/kg/claims.nq.gz"
+    },
+    "saved_at": "2026-02-06T22:25:33.376267+00:00"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "run_id": "rdf_20260206T222533Z_2e24fe",
+  "theme": "general",
+  "hosts": [
+    "*"
+  ],
+  "time_window": {
+    "start": "2010-01-01",
+    "end": "2012-12-31"
+  },
+  "input_candidates": 4,
+  "provenance_records": 4,
+  "claims_path": "/Users/eddie/Documents/axeon-multi-llm-orchestrator/state/rdf_forensics_runs/rdf_20260206T222533Z_2e24fe/kg/claims.nq.gz",
+  "cached": false
+}

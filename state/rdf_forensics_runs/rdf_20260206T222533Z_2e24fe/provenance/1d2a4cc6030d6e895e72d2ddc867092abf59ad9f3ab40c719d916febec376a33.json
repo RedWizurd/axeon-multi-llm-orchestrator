@@ -1,0 +1,24 @@
+{
+  "digest": "1d2a4cc6030d6e895e72d2ddc867092abf59ad9f3ab40c719d916febec376a33",
+  "retrieved_at": "2026-02-06T22:25:33.375544+00:00",
+  "source": {
+    "original_url": "file:///Users/eddie/Documents/textdocs/background_consultation_mvp.md",
+    "snapshot_timestamp": null,
+    "retrieval_url": "file:///Users/eddie/Documents/textdocs/background_consultation_mvp.md"
+  },
+  "http": {
+    "status": 200,
+    "content_type": "text/markdown",
+    "content_length": 8339
+  },
+  "file": {
+    "path": "/Users/eddie/Documents/textdocs/background_consultation_mvp.md",
+    "bytes": 8339,
+    "sha256": "1d2a4cc6030d6e895e72d2ddc867092abf59ad9f3ab40c719d916febec376a33",
+    "sha256_postcheck": "1d2a4cc6030d6e895e72d2ddc867092abf59ad9f3ab40c719d916febec376a33"
+  },
+  "parse": {
+    "detected_format": "unknown",
+    "parse_ok": true
+  }
+}

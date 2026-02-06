@@ -1,0 +1,45 @@
+{
+  "engine": {
+    "use_langgraph": true,
+    "local_first": true,
+    "writer_model": "local_qwen",
+    "consult_candidates": ["grok", "chatgpt", "deepseek", "gemini", "local_qwen"],
+    "max_writer_tokens": 1200,
+    "max_consult_output_tokens": 900,
+    "timeout_s": 30
+  },
+  "budgets": {
+    "max_consult_ratio": 0.2,
+    "max_consults_per_day": 20,
+    "max_total_consult_tokens_per_day": 20000
+  },
+  "policy": {
+    "one_writer": true,
+    "allow_external_calls": true,
+    "allow_sending_user_content": false,
+    "redact_secrets": true
+  },
+  "audits": {
+    "events_path": "./events.jsonl"
+  },
+  "adapters": {
+    "agent0": {
+      "enabled": false,
+      "mock_mode": true,
+      "timeout_s": 45,
+      "command_template": "./agent0ctl.sh run --task {task}"
+    },
+    "chatdev": {
+      "enabled": false,
+      "theme": "clinic",
+      "roles": ["Architect", "Implementer", "Tester"],
+      "director_role": "Medical Director",
+      "max_steps": 5
+    },
+    "rdf_forensics": {
+      "enabled": false,
+      "policy_path": "./policies/rdf_forensics_policy.json",
+      "overrides": {}
+    }
+  }
+}

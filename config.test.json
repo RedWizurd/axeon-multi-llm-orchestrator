@@ -1,0 +1,26 @@
+{
+  "engine": {
+    "use_langgraph": false,
+    "writer_model": "local_qwen"
+  },
+  "adapters": {
+    "agent0": {
+      "enabled": true,
+      "mock_mode": true
+    },
+    "chatdev": {
+      "enabled": true,
+      "theme": "clinic"
+    },
+    "rdf_forensics": {
+      "enabled": true,
+      "policy_path": "./policies/rdf_forensics_policy.json",
+      "overrides": {
+        "data_roots": ["/Users/eddie/Documents/textdocs"],
+        "max_files": 5,
+        "run_root": "./state/rdf_forensics_runs",
+        "cache_file": "./state/rdf_forensics_cache.json"
+      }
+    }
+  }
+}

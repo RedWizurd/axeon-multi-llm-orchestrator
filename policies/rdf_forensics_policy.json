@@ -1,0 +1,18 @@
+{
+  "theme": "general",
+  "hosts": ["*"],
+  "time_window": {
+    "start": "2010-01-01",
+    "end": "2012-12-31"
+  },
+  "max_files": 32,
+  "max_bytes": 104857600,
+  "allow_private_local_paths": true,
+  "allow_network_pulls": false,
+  "data_roots": [
+    "/Users/eddie/Documents/textdocs",
+    "/Users/eddie/Documents/data_pulls"
+  ],
+  "run_root": "./state/rdf_forensics_runs",
+  "cache_file": "./state/rdf_forensics_cache.json"
+}

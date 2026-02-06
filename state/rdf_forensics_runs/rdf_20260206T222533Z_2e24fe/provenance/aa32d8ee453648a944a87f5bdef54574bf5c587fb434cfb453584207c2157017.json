@@ -1,0 +1,24 @@
+{
+  "digest": "aa32d8ee453648a944a87f5bdef54574bf5c587fb434cfb453584207c2157017",
+  "retrieved_at": "2026-02-06T22:25:33.375716+00:00",
+  "source": {
+    "original_url": "file:///Users/eddie/Documents/textdocs/future_specs/business_plan_v0.1.md",
+    "snapshot_timestamp": null,
+    "retrieval_url": "file:///Users/eddie/Documents/textdocs/future_specs/business_plan_v0.1.md"
+  },
+  "http": {
+    "status": 200,
+    "content_type": "text/markdown",
+    "content_length": 3415
+  },
+  "file": {
+    "path": "/Users/eddie/Documents/textdocs/future_specs/business_plan_v0.1.md",
+    "bytes": 3415,
+    "sha256": "aa32d8ee453648a944a87f5bdef54574bf5c587fb434cfb453584207c2157017",
+    "sha256_postcheck": "aa32d8ee453648a944a87f5bdef54574bf5c587fb434cfb453584207c2157017"
+  },
+  "parse": {
+    "detected_format": "unknown",
+    "parse_ok": true
+  }
+}
