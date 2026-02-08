@@ -1,19 +1,12 @@
 {
+  "ollama_host": "http://localhost:11434",
   "models": {
-    "writer": "qwen2.5:7b-instruct-q4_K_M",
-    "consult": "deepseek-coder:6.7b-instruct-q5_K_M"
-  },
-  "budgets": {
-    "max_consult_ratio": 0.2,
-    "max_consults_per_day": 20,
-    "max_tokens_per_day": 999999999
+    "writer": "qwen",
+    "consult": "deepseek-coder"
   },
   "adapters": {
     "chatdev": {
       "enabled": true
     }
-  },
-  "ollama": {
-    "host": "http://127.0.0.1:11434"
   }
 }
