@@ -1,0 +1,27 @@
+INFO:     Will watch for changes in these directories: ['/Users/eddie/Documents/axeon-multi-llm-orchestrator']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [91534] using StatReload
+2026-02-08 11:10:56,508 INFO [axeon_server] Loaded configuration from /Users/eddie/Documents/axeon-multi-llm-orchestrator/config.json
+INFO:     Started server process [91536]
+INFO:     Waiting for application startup.
+2026-02-08 11:10:56,528 INFO [axeon_server] Axeon server started on port 8000
+INFO:     Application startup complete.
+INFO:     127.0.0.1:63121 - "OPTIONS /v1/chat/completions HTTP/1.1" 200 OK
+2026-02-08 11:12:30,512 INFO [httpx] HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+2026-02-08 11:12:30,513 INFO [axeon_server] Chat completion successful model=Axeon temperature=0.70 query=USER: hello response_chars=54
+INFO:     127.0.0.1:63121 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-02-08 11:12:31,738 INFO [httpx] HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+2026-02-08 11:12:31,738 INFO [axeon_server] Chat completion successful model=Axeon temperature=0.70 query=USER: ### Task:\nSuggest 3-5 relevant follow-up questions or prompts that the user might naturally ask next in this conversation as a **user**, based on the chat history, to help continue or deepen th [...] mat: { "follow_ups": ["Question 1... response_chars=54
+INFO:     127.0.0.1:63121 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-02-08 11:12:32,642 INFO [httpx] HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+2026-02-08 11:12:32,643 INFO [axeon_server] Chat completion successful model=Axeon temperature=0.70 query=USER: ### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.\n### Guidelines:\n- The title should clearly represent the main theme or subject of the conversation.\n- [...] n Healthcare" },\n- { "title": "🎮... response_chars=54
+INFO:     127.0.0.1:63121 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-02-08 11:12:33,344 INFO [httpx] HTTP Request: POST http://127.0.0.1:11434/api/chat "HTTP/1.1 200 OK"
+2026-02-08 11:12:33,345 INFO [axeon_server] Chat completion successful model=Axeon temperature=0.70 query=USER: ### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history, along with 1-3 more specific subtopic tags.\n\n### Guidelines:\n- Start with high-level domains (e.g. Science [...] \n\n### Output:\nJSON format: { "... response_chars=54
+INFO:     127.0.0.1:63121 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-02-08 11:15:05,456 INFO [axeon_server] Axeon server shutting down. Cleanup complete.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [91536]
+INFO:     Stopping reloader process [91534]

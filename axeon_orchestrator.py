@@ -27,7 +27,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "budgets": {
         "max_consult_ratio": 0.20,
         "max_consults_per_day": 20,
-        "max_tokens_per_day": 20000,
+        "max_tokens_per_day": 999999999,
     },
     "adapters": {
         "chatdev": {"enabled": False},
