@@ -1,8 +1,8 @@
 {
   "ollama_host": "http://localhost:11434",
   "models": {
-    "writer": "qwen",
-    "consult": "deepseek-coder"
+    "writer": "qwen2.5:7b-instruct-q4_K_M",
+    "consult": "deepseek-coder:6.7b-instruct-q5_K_M"
   },
   "adapters": {
     "chatdev": {
