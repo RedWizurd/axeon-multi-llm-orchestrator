@@ -1,22 +1,73 @@
 # Axeon-Full
 
-A multi-LLM orchestrator for clinical AI assistance, using Ollama, FastAPI, and ChatDev-style agents.
+A multi-LLM orchestrator using Ollama + FastAPI, now with configurable parallel swarm execution, bounded tool-calling loops, trace logs, and optional web-AI fallback routing.
 
 ## Setup
-1. Install dependencies: `pip install fastapi uvicorn requests pydantic`
-2. Run Ollama: `ollama serve` and pull models: `ollama pull qwen` `ollama pull deepseek-coder`
-3. Configure `config.json` (ollama_host, models, etc.)
-4. Delete or clear `budget_state.json` if exists.
-5. Run the server: `python axeon_server.py` or use `start-all.sh` for full stack.
+1. Install dependencies:
+   - `pip install fastapi uvicorn requests pydantic`
+   - Optional for web fallback scraping: `pip install selenium`
+2. Run Ollama and pull models:
+   - `ollama serve`
+   - `ollama pull qwen2.5:7b-instruct-q4_K_M`
+   - `ollama pull deepseek-coder:6.7b-instruct-q5_K_M`
+3. Configure `config.json`.
+4. Run server:
+   - `python axeon_server.py`
 
-## Usage
-- Connect to http://127.0.0.1:8000/v1 in Open WebUI.
-- Chat with Axeon: Simple queries use writer model; complex tasks (e.g., "build a clinic app") engage agent swarm.
-- Endpoints: /health, /models, /chat/completions (supports stream=true).
+## New Config Options
+- `swarm_mode`: `"sequential"` (safe default) or `"parallel"`.
+- `max_iterations`: iterative self-improvement loop cap for self-improvement tasks.
+- `include_swarm_trace`: include `swarm_trace` in non-stream responses by default.
+- `history.max_chars` / `history.keep_recent`: context compression controls.
+- `tools.enabled`, `tools.max_tool_calls_per_agent`, `tools.allowed_roots`: bounded ReAct tool loop safety controls.
+- `web_fallback.enabled`, `web_fallback.preferred_for`: route matching tasks to web AI first, fallback local on failure.
+- `web_fallback.api_url` / `web_fallback.selenium.*`: API-first or Selenium scraping fallback options.
+- `rate_limit.enabled`, `rate_limit.requests_per_min`: per-IP request limits.
+- `api_key`: optional bearer token auth (`Authorization: Bearer <key>`).
 
-## Troubleshooting
-- Check logs for Ollama connection issues.
-- If crash: Ensure models are pulled and host is correct.
-- For streaming: Use in compatible UIs like Open WebUI.
+## Endpoints
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/chat/completions` (`stream=true` supported)
+- `GET /logs` (recent in-memory swarm traces)
 
-Enjoy your upgraded Axeon!
+## How To Test Upgrades
+1. Tool loop test (calculator/search trigger):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "axeon",
+    "include_swarm_trace": true,
+    "messages": [
+      {"role": "user", "content": "Use tools if needed: calculate (42*19)+7 and briefly explain the result."}
+    ]
+  }'
+```
+
+2. Parallel swarm test (`config.json` set `"swarm_mode": "parallel"`):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "axeon",
+    "temperature": 0.4,
+    "include_swarm_trace": true,
+    "messages": [
+      {"role": "user", "content": "Design and implement a Python rate-limited API client with tests and edge-case review."}
+    ]
+  }'
+```
+
+3. Logs endpoint:
+
+```bash
+curl -s "http://127.0.0.1:8000/logs?limit=20"
+```
+
+## Notes
+- Streaming remains OpenAI-style SSE (`data: {choices:[{delta:{content:...}}]}`).
+- If web fallback fails (missing login/session/driver), Axeon automatically falls back to local Ollama path.
+- Self-improvement tasks can produce patch/diff output, but no auto-apply is performed.

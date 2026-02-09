@@ -8,5 +8,47 @@
     "chatdev": {
       "enabled": true
     }
-  }
+  },
+  "swarm_mode": "sequential",
+  "max_iterations": 1,
+  "include_swarm_trace": false,
+  "history": {
+    "max_chars": 9000,
+    "keep_recent": 8
+  },
+  "tools": {
+    "enabled": true,
+    "max_tool_calls_per_agent": 3,
+    "request_timeout_seconds": 12,
+    "allowed_roots": [
+      "."
+    ]
+  },
+  "web_fallback": {
+    "enabled": true,
+    "preferred_for": [
+      "creative",
+      "research",
+      "current_events"
+    ],
+    "provider": "gemini",
+    "api_url": null,
+    "api_key": null,
+    "timeout_seconds": 45,
+    "selenium": {
+      "enabled": true,
+      "headless": true,
+      "url": "https://gemini.google.com/app",
+      "input_selector": "textarea",
+      "submit_selector": null,
+      "response_selector": "div.markdown, div.response-content, model-response, message-content",
+      "timeout_seconds": 45,
+      "chrome_user_data_dir": null
+    }
+  },
+  "rate_limit": {
+    "enabled": false,
+    "requests_per_min": 60
+  },
+  "api_key": null
 }

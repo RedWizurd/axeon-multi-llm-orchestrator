@@ -1,109 +1,969 @@
+from __future__ import annotations
+
+import concurrent.futures
 import json
+import logging
+import re
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from threading import Lock
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-from typing import Dict, List, Any
 
-class Agent:
-    def __init__(self, role: str, model: str, ollama_host: str):
-        self.role = role
-        self.model = model
-        self.ollama_host = ollama_host
+from tools import ToolExecutor
 
-    def act(self, task: str, history: List[Dict[str, str]]) -> str:
-        prompt = f"You are an expert AI agent with role: {self.role}\n\nCurrent task: {task}\n\nConversation history so far:\n{json.dumps(history, indent=2)}\n\nYour response:"
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.7}
-        }
+LOGGER = logging.getLogger("axeon_orchestrator")
+
+_RECENT_TRACES: deque[Dict[str, Any]] = deque(maxlen=300)
+_TRACE_LOCK = Lock()
+
+
+@dataclass
+class TurnResult:
+    response: str
+    swarm_trace: List[Dict[str, Any]] = field(default_factory=list)
+    used_swarm: bool = False
+    used_web: bool = False
+    mode: str = "direct"
+
+
+def _truncate_text(text: str, max_len: int = 500) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return f"{text[: max_len - 3]}..."
+
+
+def _normalize_history(history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for msg in history or []:
+        role = str(msg.get("role", "user")).strip()
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        entry = {"role": role, "content": content}
+        if msg.get("name"):
+            entry["name"] = str(msg.get("name"))
+        normalized.append(entry)
+    return normalized
+
+
+def _compress_history(
+    history: List[Dict[str, str]],
+    max_chars: int = 9000,
+    keep_recent: int = 8,
+) -> List[Dict[str, str]]:
+    if not history:
+        return []
+
+    serialized = json.dumps(history, ensure_ascii=False)
+    if len(serialized) <= max_chars:
+        return history
+
+    recent = history[-keep_recent:]
+    older = history[:-keep_recent]
+    summary_lines = []
+    for msg in older[-20:]:
+        role = msg.get("role", "user")
+        content = _truncate_text(msg.get("content", ""), 220)
+        summary_lines.append(f"- {role}: {content}")
+
+    summary = "Earlier conversation summary:\n" + "\n".join(summary_lines)
+    return [{"role": "system", "content": summary}] + recent
+
+
+def _history_to_text(history: List[Dict[str, str]], max_items: int = 20) -> str:
+    lines: List[str] = []
+    for msg in history[-max_items:]:
+        role = msg.get("role", "user")
+        name = msg.get("name")
+        prefix = f"{role}/{name}" if name else role
+        content = _truncate_text(msg.get("content", ""), 1200)
+        lines.append(f"{prefix}: {content}")
+    return "\n".join(lines)
+
+
+def _extract_tool_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+
+    candidates = [text.strip()]
+    fenced = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+    candidates.extend(fenced)
+
+    brace_match = re.search(r"(\{[\s\S]*\})", text)
+    if brace_match:
+        candidates.append(brace_match.group(1))
+
+    for candidate in candidates:
         try:
-            response = requests.post(f"{self.ollama_host}/api/generate", json=payload, timeout=120)
-            response.raise_for_status()
-            return response.json().get("response", "").strip()
-        except Exception as e:
-            return f"[{self.role} ERROR]: {str(e)}"
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        tool_name = payload.get("tool")
+        if isinstance(tool_name, str) and tool_name.strip():
+            args = payload.get("args")
+            if not isinstance(args, dict):
+                args = {"value": args}
+            thought = payload.get("thought")
+            return {
+                "tool": tool_name.strip(),
+                "args": args,
+                "thought": thought if isinstance(thought, str) else "",
+            }
+    return None
+
+
+def _extract_thought(text: str) -> str:
+    tool_payload = _extract_tool_json(text)
+    if tool_payload and tool_payload.get("thought"):
+        return _truncate_text(tool_payload["thought"], 180)
+
+    match = re.search(r"(?:^|\n)thought\s*:\s*(.+)", text, flags=re.IGNORECASE)
+    if match:
+        return _truncate_text(match.group(1), 180)
+
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    return _truncate_text(first_line, 180)
+
+
+def _looks_bad_output(text: str) -> bool:
+    clean = (text or "").strip()
+    low = clean.lower()
+    return not clean or len(clean) < 20 or "[error" in low or "failed" in low or "traceback" in low
+
+
+def _is_complex_query(message: str) -> bool:
+    low = (message or "").lower()
+    keywords = [
+        "build",
+        "design",
+        "architecture",
+        "debug",
+        "refactor",
+        "plan",
+        "multi-step",
+        "orchestrate",
+        "research",
+        "analyze",
+        "optimize",
+        "improve",
+        "implement",
+    ]
+    return len(low) > 240 or any(word in low for word in keywords)
+
+
+def _is_self_improvement_request(message: str) -> bool:
+    low = (message or "").lower()
+    keywords = ["improve", "optimize", "refactor", "iterate", "rewrite", "patch", "diff"]
+    return any(word in low for word in keywords)
+
+
+def _should_offer_direct_tools(message: str) -> bool:
+    low = (message or "").lower()
+    triggers = [
+        "calculate",
+        "compute",
+        "math",
+        "search",
+        "look up",
+        "latest",
+        "read file",
+        "write file",
+        "api",
+        "execute",
+        "run code",
+    ]
+    return any(trigger in low for trigger in triggers)
+
+
+def _detect_categories(message: str) -> set[str]:
+    low = (message or "").lower()
+    category_keywords = {
+        "creative": ["story", "poem", "creative", "brainstorm", "tagline", "script"],
+        "research": ["research", "compare", "sources", "citations", "investigate"],
+        "current_events": ["today", "latest", "news", "current", "this week", "breaking"],
+    }
+    hits = set()
+    for category, keywords in category_keywords.items():
+        if any(keyword in low for keyword in keywords):
+            hits.add(category)
+    return hits
+
+
+def _append_run_trace(record: Dict[str, Any]) -> None:
+    with _TRACE_LOCK:
+        _RECENT_TRACES.append(record)
+
+
+def get_recent_traces(limit: int = 50) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(limit, 200))
+    with _TRACE_LOCK:
+        return list(_RECENT_TRACES)[-safe_limit:]
+
 
 def load_config(config_path: str = "config.json") -> Dict[str, Any]:
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-def build_orchestrator_runner(config: Dict[str, Any]):
-    try:
-        ollama_host = config.get("ollama_host", "http://localhost:11434")
-        writer_model = config["models"].get("writer", "qwen")
-        consult_model = config["models"].get("consult", "deepseek-coder")
-        chatdev_enabled = config.get("adapters", {}).get("chatdev", {}).get("enabled", False)
 
-        # ChatDev-style agent swarm for complex / self-healing tasks
-        agents = [
-            Agent("CEO", consult_model, ollama_host),
-            Agent("CTO", consult_model, ollama_host),
-            Agent("Programmer", writer_model, ollama_host),
-            Agent("Tester", consult_model, ollama_host)
+def _call_ollama(
+    ollama_host: str,
+    model: str,
+    prompt: str,
+    temperature: float,
+    timeout: int,
+) -> str:
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": temperature},
+    }
+    response = requests.post(f"{ollama_host}/api/generate", json=payload, timeout=timeout)
+    response.raise_for_status()
+    return (response.json().get("response") or "").strip()
+
+
+class Agent:
+    def __init__(self, role: str, model: str, ollama_host: str, timeout: int = 120):
+        self.role = role
+        self.model = model
+        self.ollama_host = ollama_host
+        self.timeout = timeout
+
+    def _build_prompt(
+        self,
+        task: str,
+        history: List[Dict[str, str]],
+        tool_executor: Optional[ToolExecutor],
+    ) -> str:
+        tool_block = ""
+        if tool_executor:
+            tool_block = (
+                "\n\nTool usage (ReAct style):\n"
+                "- If a tool is required, reply ONLY with strict JSON: "
+                "{\"tool\": \"name\", \"args\": {...}, \"thought\": \"why\"}.\n"
+                "- Do not wrap tool JSON in prose.\n"
+                "- Available tools:\n"
+                f"{tool_executor.describe_tools()}\n"
+            )
+
+        return (
+            f"You are Axeon agent '{self.role}'.\n"
+            "Produce clear, technically correct output.\n"
+            "If the user asks for codebase improvements, you may return patch/diff text, but never auto-apply changes.\n"
+            f"Task:\n{task}\n\n"
+            f"Conversation context:\n{_history_to_text(history)}"
+            f"{tool_block}\n"
+            "Final response:"
+        )
+
+    def act(
+        self,
+        task: str,
+        history: List[Dict[str, str]],
+        temperature: float = 0.7,
+        tool_executor: Optional[ToolExecutor] = None,
+        max_tool_calls: int = 3,
+        trace: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        trace_list = trace if trace is not None else []
+        working_history = list(history)
+        tool_calls = max(0, min(max_tool_calls, 5))
+
+        for step in range(tool_calls + 1):
+            prompt = self._build_prompt(task, working_history, tool_executor)
+            try:
+                output = _call_ollama(
+                    ollama_host=self.ollama_host,
+                    model=self.model,
+                    prompt=prompt,
+                    temperature=temperature,
+                    timeout=self.timeout,
+                )
+            except Exception as exc:
+                output = f"[{self.role} ERROR] {exc}"
+
+            thought = _extract_thought(output)
+            trace_list.append(
+                {
+                    "timestamp": time.time(),
+                    "agent": self.role,
+                    "step": f"model:{step + 1}",
+                    "thought": thought,
+                    "output": output,
+                }
+            )
+            LOGGER.info("[%s] Thought: %s | Output: %s", self.role, thought, _truncate_text(output, 260))
+
+            if not tool_executor:
+                return output
+
+            tool_payload = _extract_tool_json(output)
+            if not tool_payload:
+                return output
+
+            if step >= tool_calls:
+                return f"{output}\n\n[Tool loop stopped: max tool calls reached.]"
+
+            tool_name = tool_payload["tool"]
+            tool_args = tool_payload.get("args", {})
+            try:
+                tool_result = tool_executor.execute(tool_name, tool_args)
+            except Exception as exc:
+                tool_result = {"error": str(exc)}
+
+            tool_result_text = json.dumps(tool_result, ensure_ascii=False)
+            trace_list.append(
+                {
+                    "timestamp": time.time(),
+                    "agent": self.role,
+                    "step": f"tool:{tool_name}",
+                    "thought": tool_payload.get("thought", ""),
+                    "output": tool_result_text,
+                    "tool": tool_name,
+                }
+            )
+            LOGGER.info("[%s] Tool: %s | Result: %s", self.role, tool_name, _truncate_text(tool_result_text, 260))
+
+            working_history.append({"role": "assistant", "name": self.role, "content": output})
+            working_history.append({"role": "tool", "name": tool_name, "content": tool_result_text})
+
+        return "No response generated."
+
+
+def _run_agent_with_healing(
+    agent: Agent,
+    task: str,
+    history: List[Dict[str, str]],
+    temperature: float,
+    tool_executor: Optional[ToolExecutor],
+    max_tool_calls: int,
+    healer: Optional[Agent],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    local_trace: List[Dict[str, Any]] = []
+    result = agent.act(
+        task=task,
+        history=history,
+        temperature=temperature,
+        tool_executor=tool_executor,
+        max_tool_calls=max_tool_calls,
+        trace=local_trace,
+    )
+
+    if healer and _looks_bad_output(result):
+        heal_task = (
+            "Repair the weak output below. Return a clean corrected response.\n\n"
+            f"Problematic output:\n{result}\n\nOriginal task:\n{task}"
+        )
+        healed = healer.act(
+            task=heal_task,
+            history=history + [{"role": "assistant", "name": agent.role, "content": result}],
+            temperature=temperature,
+            tool_executor=tool_executor,
+            max_tool_calls=max_tool_calls,
+            trace=local_trace,
+        )
+        if healed and not _looks_bad_output(healed):
+            result = healed
+
+    return result, local_trace
+
+
+def _execute_swarm_sequential(
+    user_message: str,
+    base_history: List[Dict[str, str]],
+    agents: Dict[str, Agent],
+    healer: Agent,
+    temperature: float,
+    tool_executor: Optional[ToolExecutor],
+    max_tool_calls: int,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    trace: List[Dict[str, Any]] = []
+    task = user_message
+    swarm_history = list(base_history) + [{"role": "user", "content": user_message}]
+
+    for role in ["CEO", "CTO", "Programmer", "Tester"]:
+        output, local_trace = _run_agent_with_healing(
+            agent=agents[role],
+            task=task,
+            history=swarm_history,
+            temperature=temperature,
+            tool_executor=tool_executor,
+            max_tool_calls=max_tool_calls,
+            healer=healer,
+        )
+        trace.extend(local_trace)
+        swarm_history.append({"role": "assistant", "name": role, "content": output})
+        task = output
+
+    for msg in reversed(swarm_history):
+        content = msg.get("content", "")
+        if msg.get("role") == "assistant" and content and "error" not in content.lower():
+            return content, trace
+
+    return "Swarm completed but no valid final response generated.", trace
+
+
+def _tester_parallel_pipeline(
+    tester: Agent,
+    merged_task: str,
+    swarm_history: List[Dict[str, str]],
+    programmer_future: concurrent.futures.Future,
+    temperature: float,
+    tool_executor: Optional[ToolExecutor],
+    max_tool_calls: int,
+    healer: Agent,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    trace: List[Dict[str, Any]] = []
+
+    precheck_task = (
+        "Create a QA checklist while implementation runs. Focus on correctness, edge cases, and test strategy.\n\n"
+        f"Plan:\n{merged_task}"
+    )
+    checklist, checklist_trace = _run_agent_with_healing(
+        agent=tester,
+        task=precheck_task,
+        history=swarm_history,
+        temperature=temperature,
+        tool_executor=tool_executor,
+        max_tool_calls=max_tool_calls,
+        healer=healer,
+    )
+    trace.extend(checklist_trace)
+
+    programmer_output, _ = programmer_future.result()
+
+    review_task = (
+        "Review the Programmer output using the QA checklist. Identify defects, risks, and fixes.\n\n"
+        f"QA Checklist:\n{checklist}\n\n"
+        f"Programmer Output:\n{programmer_output}"
+    )
+    review_history = swarm_history + [{"role": "assistant", "name": "Programmer", "content": programmer_output}]
+    review, review_trace = _run_agent_with_healing(
+        agent=tester,
+        task=review_task,
+        history=review_history,
+        temperature=temperature,
+        tool_executor=tool_executor,
+        max_tool_calls=max_tool_calls,
+        healer=healer,
+    )
+    trace.extend(review_trace)
+
+    combined = f"QA Checklist:\n{checklist}\n\nQA Review:\n{review}"
+    return combined, trace
+
+
+def _execute_swarm_parallel(
+    user_message: str,
+    base_history: List[Dict[str, str]],
+    agents: Dict[str, Agent],
+    healer: Agent,
+    temperature: float,
+    tool_executor: Optional[ToolExecutor],
+    max_tool_calls: int,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    trace: List[Dict[str, Any]] = []
+    swarm_history = list(base_history) + [{"role": "user", "content": user_message}]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        ceo_future = pool.submit(
+            _run_agent_with_healing,
+            agents["CEO"],
+            user_message,
+            swarm_history,
+            temperature,
+            tool_executor,
+            max_tool_calls,
+            healer,
+        )
+        cto_future = pool.submit(
+            _run_agent_with_healing,
+            agents["CTO"],
+            user_message,
+            swarm_history,
+            temperature,
+            tool_executor,
+            max_tool_calls,
+            healer,
+        )
+
+        ceo_output, ceo_trace = ceo_future.result()
+        cto_output, cto_trace = cto_future.result()
+        trace.extend(ceo_trace)
+        trace.extend(cto_trace)
+
+        merged_task = (
+            "Merge these two strategic plans into a concrete implementation directive.\n\n"
+            f"CEO Plan:\n{ceo_output}\n\n"
+            f"CTO Plan:\n{cto_output}\n\n"
+            "Deliver practical implementation details."
+        )
+
+        merged_history = swarm_history + [
+            {"role": "assistant", "name": "CEO", "content": ceo_output},
+            {"role": "assistant", "name": "CTO", "content": cto_output},
         ]
 
-        def runner(user_message: str, history: List[Dict[str, str]] = []) -> str:
-            # Quick intent check: use swarm for anything that looks like dev, planning, debugging, complex reasoning
-            intent_prompt = f"Is this query likely to benefit from a multi-agent breakdown (software development, debugging, complex planning, research, multi-step reasoning)? Answer only 'yes' or 'no'.\n\nQuery: {user_message}"
+        programmer_future = pool.submit(
+            _run_agent_with_healing,
+            agents["Programmer"],
+            merged_task,
+            merged_history,
+            temperature,
+            tool_executor,
+            max_tool_calls,
+            healer,
+        )
+
+        tester_future = pool.submit(
+            _tester_parallel_pipeline,
+            agents["Tester"],
+            merged_task,
+            merged_history,
+            programmer_future,
+            temperature,
+            tool_executor,
+            max_tool_calls,
+            healer,
+        )
+
+        programmer_output, programmer_trace = programmer_future.result()
+        tester_output, tester_trace = tester_future.result()
+        trace.extend(programmer_trace)
+        trace.extend(tester_trace)
+
+    final_output = programmer_output
+    if tester_output:
+        final_output = f"{programmer_output}\n\nTester Findings:\n{tester_output}"
+
+    return final_output, trace
+
+
+def _intent_check(
+    user_message: str,
+    chatdev_enabled: bool,
+    ollama_host: str,
+    consult_model: str,
+) -> bool:
+    if not chatdev_enabled:
+        return False
+
+    intent_prompt = (
+        "Is this query likely to benefit from a multi-agent breakdown "
+        "(software development, debugging, complex planning, research, multi-step reasoning)? "
+        "Answer only 'yes' or 'no'.\n\n"
+        f"Query: {user_message}"
+    )
+
+    try:
+        decision = _call_ollama(
+            ollama_host=ollama_host,
+            model=consult_model,
+            prompt=intent_prompt,
+            temperature=0.0,
+            timeout=25,
+        ).lower()
+        return "yes" in decision
+    except Exception:
+        return _is_complex_query(user_message)
+
+
+def _call_web_ai_api(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[str, Any]) -> Optional[str]:
+    api_url = web_cfg.get("api_url")
+    if not api_url:
+        return None
+
+    payload = {
+        "prompt": user_message,
+        "history": history,
+        "provider": web_cfg.get("provider", "gemini"),
+    }
+    headers = {"Content-Type": "application/json"}
+    api_key = web_cfg.get("api_key")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    timeout = int(web_cfg.get("timeout_seconds", 45))
+    response = requests.post(api_url, json=payload, headers=headers, timeout=max(5, min(timeout, 90)))
+    response.raise_for_status()
+
+    data = response.json() if "application/json" in response.headers.get("content-type", "") else {}
+    for key in ["response", "text", "output", "content"]:
+        if isinstance(data.get(key), str) and data[key].strip():
+            return data[key].strip()
+
+    if isinstance(response.text, str) and response.text.strip():
+        return response.text.strip()
+    return None
+
+
+def _call_web_ai_selenium(user_message: str, web_cfg: Dict[str, Any]) -> Optional[str]:
+    selenium_cfg = web_cfg.get("selenium", {})
+    if selenium_cfg.get("enabled", True) is False:
+        return None
+
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.support.ui import WebDriverWait
+    except Exception as exc:
+        LOGGER.warning("Selenium unavailable for web fallback: %s", exc)
+        return None
+
+    url = selenium_cfg.get("url") or "https://gemini.google.com/app"
+    input_selector = selenium_cfg.get("input_selector", "textarea")
+    submit_selector = selenium_cfg.get("submit_selector")
+    response_selector = selenium_cfg.get(
+        "response_selector",
+        "div.markdown, div.response-content, model-response, message-content",
+    )
+    timeout_seconds = int(selenium_cfg.get("timeout_seconds", 45))
+
+    options = webdriver.ChromeOptions()
+    if selenium_cfg.get("headless", True):
+        options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+
+    chrome_profile = selenium_cfg.get("chrome_user_data_dir")
+    if chrome_profile:
+        options.add_argument(f"--user-data-dir={chrome_profile}")
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=options)
+        wait = WebDriverWait(driver, timeout_seconds)
+        driver.get(url)
+
+        input_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, input_selector)))
+        input_box.clear()
+        input_box.send_keys(user_message)
+
+        if submit_selector:
+            submit = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, submit_selector)))
+            submit.click()
+        else:
+            input_box.send_keys(Keys.ENTER)
+
+        def _has_response(_driver: Any) -> bool:
+            elements = _driver.find_elements(By.CSS_SELECTOR, response_selector)
+            return bool(elements and elements[-1].text and elements[-1].text.strip())
+
+        wait.until(_has_response)
+        elements = driver.find_elements(By.CSS_SELECTOR, response_selector)
+        if not elements:
+            return None
+        text = (elements[-1].text or "").strip()
+        return text or None
+    except Exception as exc:
+        LOGGER.warning("Web selenium fallback failed: %s", exc)
+        return None
+    finally:
+        if driver:
             try:
-                intent_resp = requests.post(
-                    f"{ollama_host}/api/generate",
-                    json={"model": consult_model, "prompt": intent_prompt, "stream": False},
-                    timeout=30
-                ).json().get("response", "").strip().lower()
-                use_swarm = chatdev_enabled and "yes" in intent_resp
-            except:
-                use_swarm = False  # fallback to direct if intent check fails
+                driver.quit()
+            except Exception:
+                pass
+
+
+def _try_web_ai(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[str, Any]) -> Optional[str]:
+    if not web_cfg.get("enabled", False):
+        return None
+
+    preferred_for = set(web_cfg.get("preferred_for", []))
+    categories = _detect_categories(user_message)
+    if preferred_for:
+        if not categories:
+            return None
+        if not (preferred_for & categories):
+            return None
+
+    try:
+        api_response = _call_web_ai_api(user_message, history, web_cfg)
+        if api_response:
+            return api_response
+    except Exception as exc:
+        LOGGER.warning("Web API fallback failed: %s", exc)
+
+    try:
+        selenium_response = _call_web_ai_selenium(user_message, web_cfg)
+        if selenium_response:
+            return selenium_response
+    except Exception as exc:
+        LOGGER.warning("Web Selenium fallback failed: %s", exc)
+
+    return None
+
+
+def build_orchestrator_runner(config: Dict[str, Any]):
+    try:
+        base_dir = Path(__file__).resolve().parent
+        ollama_host = config.get("ollama_host", "http://localhost:11434")
+        models = config.get("models", {})
+        writer_model = models.get("writer", "qwen2.5:7b-instruct-q4_K_M")
+        consult_model = models.get("consult", "deepseek-coder:6.7b-instruct-q5_K_M")
+
+        adapters = config.get("adapters", {})
+        chatdev_enabled = adapters.get("chatdev", {}).get("enabled", False)
+
+        tools_cfg = config.get("tools", {})
+        tools_enabled = tools_cfg.get("enabled", True)
+        max_tool_calls = int(tools_cfg.get("max_tool_calls_per_agent", 3))
+        allowed_roots = tools_cfg.get("allowed_roots") or [str(base_dir)]
+        tool_timeout = int(tools_cfg.get("request_timeout_seconds", 12))
+
+        tool_executor: Optional[ToolExecutor] = None
+        if tools_enabled:
+            tool_executor = ToolExecutor(
+                base_dir=base_dir,
+                allowed_roots=allowed_roots,
+                request_timeout=tool_timeout,
+            )
+
+        swarm_mode = str(config.get("swarm_mode", "sequential")).lower().strip()
+        if swarm_mode not in {"sequential", "parallel"}:
+            swarm_mode = "sequential"
+
+        web_cfg = config.get("web_fallback", {})
+
+        max_iterations = max(1, int(config.get("max_iterations", 1)))
+        history_cfg = config.get("history", {})
+        history_max_chars = int(history_cfg.get("max_chars", 9000))
+        history_keep_recent = int(history_cfg.get("keep_recent", 8))
+
+        agents = {
+            "CEO": Agent("CEO", consult_model, ollama_host),
+            "CTO": Agent("CTO", consult_model, ollama_host),
+            "Programmer": Agent("Programmer", writer_model, ollama_host),
+            "Tester": Agent("Tester", consult_model, ollama_host),
+            "DirectWriter": Agent("DirectWriter", writer_model, ollama_host),
+        }
+        healer = Agent("Error Healer", consult_model, ollama_host)
+
+        def execute_swarm_once(
+            prompt_text: str,
+            base_history: List[Dict[str, str]],
+            temperature: float,
+        ) -> Tuple[str, List[Dict[str, Any]]]:
+            if swarm_mode == "parallel":
+                return _execute_swarm_parallel(
+                    user_message=prompt_text,
+                    base_history=base_history,
+                    agents=agents,
+                    healer=healer,
+                    temperature=temperature,
+                    tool_executor=tool_executor,
+                    max_tool_calls=max_tool_calls,
+                )
+            return _execute_swarm_sequential(
+                user_message=prompt_text,
+                base_history=base_history,
+                agents=agents,
+                healer=healer,
+                temperature=temperature,
+                tool_executor=tool_executor,
+                max_tool_calls=max_tool_calls,
+            )
+
+        def runner(
+            user_message: str,
+            history: Optional[List[Dict[str, str]]] = None,
+            temperature: float = 0.7,
+            include_trace: bool = False,
+        ) -> TurnResult:
+            run_id = f"axeon-{uuid.uuid4().hex[:12]}"
+            norm_history = _normalize_history(history)
+            compact_history = _compress_history(
+                norm_history,
+                max_chars=history_max_chars,
+                keep_recent=history_keep_recent,
+            )
+
+            trace: List[Dict[str, Any]] = []
+            use_swarm = _intent_check(user_message, chatdev_enabled, ollama_host, consult_model)
+
+            used_web = False
+            if use_swarm and web_cfg.get("enabled", False):
+                web_output = _try_web_ai(user_message, compact_history, web_cfg)
+                if web_output:
+                    used_web = True
+                    trace.append(
+                        {
+                            "timestamp": time.time(),
+                            "agent": "WebFallback",
+                            "step": "web_ai",
+                            "thought": "Web AI selected based on routing preference.",
+                            "output": web_output,
+                        }
+                    )
+                    result = TurnResult(
+                        response=web_output,
+                        swarm_trace=trace if include_trace else [],
+                        used_swarm=True,
+                        used_web=True,
+                        mode="web",
+                    )
+                    _append_run_trace(
+                        {
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "mode": result.mode,
+                            "used_swarm": result.used_swarm,
+                            "used_web": result.used_web,
+                            "input": _truncate_text(user_message, 500),
+                            "response": _truncate_text(result.response, 1200),
+                            "swarm_trace": trace,
+                        }
+                    )
+                    return result
 
             if use_swarm:
-                task = user_message
-                swarm_history = [{"role": "user", "content": user_message}]
-                for agent in agents:
-                    result = agent.act(task, swarm_history)
-                    swarm_history.append({"role": agent.role, "content": result})
-                    task = result  # pass output forward
+                response, swarm_trace = execute_swarm_once(user_message, compact_history, temperature)
+                trace.extend(swarm_trace)
 
-                    # Self-healing: if obvious error, add a quick repair step
-                    if "ERROR" in result or "failed" in result.lower() or len(result) < 20:
-                        healer = Agent("Error Healer", consult_model, ollama_host)
-                        fix = healer.act(f"Analyze and repair this failure:\n{result}\nContext: {task}", swarm_history)
-                        swarm_history.append({"role": "Healer", "content": fix})
-                        task = fix
+                if max_iterations > 1 and _is_self_improvement_request(user_message):
+                    iterative_response = response
+                    for iteration in range(2, max_iterations + 1):
+                        if iterative_response.strip().lower().startswith("done"):
+                            break
 
-                # Final output is the last non-error result
-                for entry in reversed(swarm_history):
-                    if entry["role"] != "user" and "ERROR" not in entry["content"]:
-                        return entry["content"]
-                return "Swarm completed but no valid final response generated."
+                        refine_prompt = (
+                            f"Iteration {iteration}/{max_iterations}. Improve the previous output. "
+                            "If no further improvements are needed, respond with DONE.\n\n"
+                            f"Original user request:\n{user_message}\n\n"
+                            f"Previous output:\n{iterative_response}"
+                        )
+                        next_output, next_trace = execute_swarm_once(
+                            refine_prompt,
+                            compact_history + [{"role": "assistant", "content": iterative_response}],
+                            temperature,
+                        )
+                        for item in next_trace:
+                            item["iteration"] = iteration
+                        trace.extend(next_trace)
 
+                        if next_output.strip().lower().startswith("done"):
+                            break
+                        iterative_response = next_output
+
+                    response = iterative_response
+
+                result = TurnResult(
+                    response=response,
+                    swarm_trace=trace if include_trace else [],
+                    used_swarm=True,
+                    used_web=used_web,
+                    mode=swarm_mode,
+                )
             else:
-                # Direct single-model response (fast path)
-                full_prompt = f"History:\n{json.dumps(history, indent=2)}\n\nUser: {user_message}\n\nAssistant:"
-                try:
-                    resp = requests.post(
-                        f"{ollama_host}/api/generate",
-                        json={"model": writer_model, "prompt": full_prompt, "stream": False},
-                        timeout=90
-                    ).json().get("response", "").strip()
-                    return resp or "No response generated."
-                except Exception as e:
-                    return f"Direct model failed: {str(e)}. Try again."
+                direct_task = (
+                    "Respond directly to the user's request. Keep it accurate and practical.\n\n"
+                    f"User request:\n{user_message}"
+                )
+
+                direct_tools_enabled = bool(tool_executor and _should_offer_direct_tools(user_message))
+                direct_trace: List[Dict[str, Any]] = []
+                response = agents["DirectWriter"].act(
+                    task=direct_task,
+                    history=compact_history + [{"role": "user", "content": user_message}],
+                    temperature=temperature,
+                    tool_executor=tool_executor if direct_tools_enabled else None,
+                    max_tool_calls=max_tool_calls,
+                    trace=direct_trace,
+                )
+                trace.extend(direct_trace)
+                result = TurnResult(
+                    response=response or "No response generated.",
+                    swarm_trace=trace if include_trace else [],
+                    used_swarm=False,
+                    used_web=False,
+                    mode="direct",
+                )
+
+            _append_run_trace(
+                {
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "mode": result.mode,
+                    "used_swarm": result.used_swarm,
+                    "used_web": result.used_web,
+                    "input": _truncate_text(user_message, 500),
+                    "response": _truncate_text(result.response, 1200),
+                    "swarm_trace": trace,
+                }
+            )
+            return result
 
         return runner
 
-    except Exception as e:
-        print(f"Orchestrator build failed: {e}")
-        def dummy_runner(user_message: str, history: List[Dict[str, str]] = []) -> str:
-            return "Axeon is starting up or encountered an init issue. Please retry in a moment."
+    except Exception as exc:
+        LOGGER.exception("Orchestrator build failed: %s", exc)
+
+        def dummy_runner(
+            user_message: str,
+            history: Optional[List[Dict[str, str]]] = None,
+            temperature: float = 0.7,
+            include_trace: bool = False,
+        ) -> TurnResult:
+            return TurnResult(
+                response="Axeon is starting up or encountered an init issue. Please retry in a moment.",
+                swarm_trace=[],
+                used_swarm=False,
+                used_web=False,
+                mode="init_error",
+            )
+
         return dummy_runner
 
-def handle_turn(user_message: str, history: List[Dict[str, str]], config_path: str = "config.json") -> str:
+
+def handle_turn_with_meta(
+    user_message: str,
+    history: Optional[List[Dict[str, str]]],
+    config_path: str = "config.json",
+    temperature: float = 0.7,
+    include_trace: bool = True,
+) -> Dict[str, Any]:
     config = load_config(config_path)
     runner = build_orchestrator_runner(config)
-    return runner(user_message, history)
+    result = runner(user_message, history or [], temperature=temperature, include_trace=include_trace)
+    return {
+        "response": result.response,
+        "swarm_trace": result.swarm_trace,
+        "used_swarm": result.used_swarm,
+        "used_web": result.used_web,
+        "mode": result.mode,
+    }
+
+
+def handle_turn(
+    user_message: str,
+    history: Optional[List[Dict[str, str]]],
+    config_path: str = "config.json",
+    temperature: float = 0.7,
+) -> str:
+    result = handle_turn_with_meta(
+        user_message=user_message,
+        history=history,
+        config_path=config_path,
+        temperature=temperature,
+        include_trace=False,
+    )
+    return result.get("response", "No response generated.")
+
 
 if __name__ == "__main__":
     print(handle_turn("Hello, Axeon! Tell me about yourself.", []))
