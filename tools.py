@@ -4,14 +4,17 @@ from __future__ import annotations
 import ast
 import json
 import os
+import random
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 MAX_FILE_READ_BYTES = 200_000
@@ -198,27 +201,112 @@ class ToolExecutor:
     def web_search(self, query: str) -> Dict[str, Any]:
         if not query or len(query.strip()) < 2:
             raise ToolExecutionError("Query must be at least 2 characters.")
+        query_clean = query.strip()
+        lower_query = query_clean.lower()
 
-        response = requests.get(
-            "https://api.duckduckgo.com/",
-            params={
-                "q": query,
-                "format": "json",
-                "no_redirect": "1",
-                "no_html": "1",
-                "skip_disambig": "1",
-            },
-            timeout=self.request_timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        results = _extract_duckduckgo_results(data, max_results=5)
+        # Fixed: proper city parsing with US append.
+        if "weather" in lower_query or "temperature" in lower_query or "forecast" in lower_query:
+            openweather_api_key = os.getenv("OPENWEATHER_API_KEY")
+            if not openweather_api_key:
+                return {"error": "OPENWEATHER_API_KEY not set or empty in .env"}
 
-        return {
-            "query": query,
-            "results": results,
-            "count": len(results),
-        }
+            city = ""
+            city_match = re.search(
+                r"(?:in|for|at)\s+([a-zA-Z\s]+(?:,\s*[a-zA-Z\s]+)?)"
+                r"(?:\s+(?:right now|now|today|currently)|[?.!]|$)",
+                query_clean,
+                re.I,
+            )
+            if city_match:
+                city = city_match.group(1).strip(" .?!,")
+            print(f"[DEBUG] Parsed city from query: {city or '<none>'}")
+            if not city:
+                return {"error": "Could not parse city from weather query.", "results": [], "count": 0}
+
+            # Prefer US disambiguation when query suggests US/California-style location.
+            city_for_query = city
+            lower_city = city.lower()
+            if (
+                "usa" in lower_query
+                or "united states" in lower_query
+                or "california" in lower_city
+                or ", ca" in lower_city
+                or re.search(r"\b[a-zA-Z\s]+,\s*[A-Z]{2}$", city)
+            ):
+                city_for_query = f"{city},US"
+
+            try:
+                url = "https://api.openweathermap.org/data/2.5/weather"
+                params = {"q": city_for_query, "appid": openweather_api_key, "units": "imperial"}
+                resp = requests.get(url, params=params, timeout=10)
+                print(f"[DEBUG] API status: {resp.status_code}")
+                resp.raise_for_status()
+                data = resp.json()
+
+                weather = data["weather"][0]["description"].capitalize()
+                temp_f = data["main"]["temp"]
+                feels_like = data["main"]["feels_like"]
+                humidity = data["main"]["humidity"]
+                wind = data["wind"]["speed"]
+                location = f"{data.get('name', city)}, {data.get('sys', {}).get('country', 'US')}"
+
+                result = (
+                    f"Current weather in {location}: {weather}. Temp: {temp_f}\u00b0F "
+                    f"(feels like {feels_like}\u00b0F). Humidity: {humidity}%. Wind: {wind} mph."
+                )
+                return {"results": [result], "count": 1}
+            except Exception as e:
+                print(f"[DEBUG] OpenWeatherMap error: {str(e)}")
+                # If weather API fails, allow downstream non-weather search fallback.
+                return {"error": f"Weather API error: {str(e)}", "results": [], "count": 0}
+
+        # Fallback: scrape DuckDuckGo Lite HTML for 3-5 results.
+        try:
+            user_agents = [
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Firefox/123.0",
+                "Axeon/1.0 (+tool:web_search)",
+            ]
+            headers = {"User-Agent": random.choice(user_agents)}
+            time.sleep(0.2)
+            response = requests.get(
+                "https://lite.duckduckgo.com/lite/",
+                params={"q": query_clean},
+                headers=headers,
+                timeout=10,
+            )
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            items: List[str] = []
+
+            # Primary selectors for DDG-like result layouts.
+            for snippet in soup.select("td.result-snippet, a.result__snippet"):
+                text = " ".join(snippet.get_text(" ", strip=True).split())
+                if text and len(text) > 20:
+                    items.append(text)
+                if len(items) >= 5:
+                    break
+
+            # Fallback to link extraction if snippet selectors are empty.
+            for link in soup.select("a[href]"):
+                title = " ".join(link.get_text(" ", strip=True).split())
+                href = (link.get("href") or "").strip()
+                if not title or len(title) < 4:
+                    continue
+                if href.startswith("/") or "duckduckgo.com" in href:
+                    continue
+                items.append(f"{title} - {href}")
+                if len(items) >= 5:
+                    break
+
+            if not items:
+                fallback_text = " ".join(soup.get_text(" ", strip=True).split())[:1000]
+                if fallback_text:
+                    return {"results": [fallback_text], "count": 1}
+                return {"error": "No search results found.", "results": [], "count": 0}
+            return {"results": items[:5], "count": min(len(items), 5)}
+        except Exception as exc:
+            return {"error": f"Web search failed: {exc}", "results": [], "count": 0}
 
     def calculator(self, expression: str) -> Dict[str, Any]:
         if not expression or len(expression) > 300:

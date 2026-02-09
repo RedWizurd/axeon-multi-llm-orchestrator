@@ -39,7 +39,7 @@
     "gemini_model": "gemini-1.5-flash",
     "timeout_seconds": 45,
     "selenium": {
-      "enabled": true,
+      "enabled": false,
       "headless": true,
       "url": "https://gemini.google.com/app",
       "input_selector": "textarea",

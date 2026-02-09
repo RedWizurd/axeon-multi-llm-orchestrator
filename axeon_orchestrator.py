@@ -295,11 +295,19 @@ def _call_ollama(
 
 
 class Agent:
-    def __init__(self, role: str, model: str, ollama_host: str, timeout: int = 120):
+    def __init__(
+        self,
+        role: str,
+        model: str,
+        ollama_host: str,
+        timeout: int = 120,
+        summary_model: Optional[str] = None,
+    ):
         self.role = role
         self.model = model
         self.ollama_host = ollama_host
         self.timeout = timeout
+        self.summary_model = summary_model or model
 
     def _build_prompt(
         self,
@@ -339,9 +347,13 @@ class Agent:
     ) -> str:
         trace_list = trace if trace is not None else []
         working_history = list(history)
-        tool_calls = max(0, min(max_tool_calls, 5))
+        max_total_tool_calls = max(0, min(max_tool_calls, 3))
+        total_tool_calls = 0
+        last_non_json_output = ""
+        last_tool_result_text = ""
+        exit_reason = "model_output"
 
-        for step in range(tool_calls + 1):
+        while True:
             prompt = self._build_prompt(task, working_history, tool_executor)
             try:
                 output = _call_ollama(
@@ -359,7 +371,7 @@ class Agent:
                 {
                     "timestamp": time.time(),
                     "agent": self.role,
-                    "step": f"model:{step + 1}",
+                    "step": f"model:{total_tool_calls + 1}",
                     "thought": thought,
                     "output": output,
                 }
@@ -371,19 +383,25 @@ class Agent:
 
             tool_payload = _extract_tool_json(output)
             if not tool_payload:
+                LOGGER.info("[%s] Tool loop exit reason: model produced final non-tool output.", self.role)
                 return output
 
-            if step >= tool_calls:
-                return f"{output}\n\n[Tool loop stopped: max tool calls reached.]"
+            if total_tool_calls >= max_total_tool_calls:
+                exit_reason = "max_tool_calls"
+                LOGGER.warning("Max tool calls reached for agent %s", self.role)
+                break
 
             tool_name = tool_payload["tool"]
             tool_args = tool_payload.get("args", {})
+            total_tool_calls += 1
+            LOGGER.info("[Tool] Attempt %s: %s(%s)", total_tool_calls, tool_name, tool_args)
             try:
                 tool_result = tool_executor.execute(tool_name, tool_args)
             except Exception as exc:
                 tool_result = {"error": str(exc)}
 
             tool_result_text = json.dumps(tool_result, ensure_ascii=False)
+            last_tool_result_text = tool_result_text
             trace_list.append(
                 {
                     "timestamp": time.time(),
@@ -394,12 +412,138 @@ class Agent:
                     "tool": tool_name,
                 }
             )
+            LOGGER.info("[Tool] Result: %s", _truncate_text(tool_result_text, 300))
             LOGGER.info("[%s] Tool: %s | Result: %s", self.role, tool_name, _truncate_text(tool_result_text, 260))
 
             working_history.append({"role": "assistant", "name": self.role, "content": output})
             working_history.append({"role": "tool", "name": tool_name, "content": tool_result_text})
 
-        return "No response generated."
+            # Force use of tool result if available
+            if tool_result_text and "error" not in tool_result_text.lower():
+                final_prompt = (
+                    "Using this tool result, give a concise, natural answer to the user:\n\n"
+                    f"Task: {task}\nTool Result: {tool_result_text}"
+                )
+                try:
+                    final_output = requests.post(
+                        f"{self.ollama_host}/api/generate",
+                        json={
+                            "model": self.summary_model,
+                            "prompt": final_prompt,
+                            "stream": False,
+                            "options": {"temperature": 0.5},
+                        },
+                        timeout=30,
+                    ).json().get("response", "").strip()
+                    if final_output:
+                        return final_output
+                except Exception as e:
+                    print(f"[DEBUG] Synthesis failed: {e}")
+
+            # Fixed: if tool returns empty/error, produce useful fallback response instead of raw JSON.
+            tool_failed = bool(tool_result.get("error")) or int(tool_result.get("count", 1) or 0) == 0
+            if tool_failed:
+                LOGGER.info("[%s] Tool loop exit reason: tool returned error/empty result.", self.role)
+                fallback_prompt = (
+                    "Tool failed, here's general info. "
+                    "Provide best-effort guidance for this user query in concise natural language.\n\n"
+                    f"User task:\n{task}\n\nTool output:\n{tool_result_text}"
+                )
+                try:
+                    fallback_nl = _call_ollama(
+                        ollama_host=self.ollama_host,
+                        model=self.summary_model,
+                        prompt=fallback_prompt,
+                        temperature=min(temperature, 0.6),
+                        timeout=self.timeout,
+                    ).strip()
+                    if fallback_nl and not _extract_tool_json(fallback_nl):
+                        return fallback_nl
+                except Exception:
+                    pass
+
+            # Prevent repeated raw JSON loops by requesting final natural-language synthesis.
+            synth_prompt = (
+                "Tool result received. Provide a final natural-language answer for the user. "
+                "Do not output tool JSON.\n\n"
+                f"Original task:\n{task}\n\nLatest tool result:\n{tool_result_text}"
+            )
+            try:
+                natural_output = _call_ollama(
+                    ollama_host=self.ollama_host,
+                    model=self.summary_model,
+                    prompt=synth_prompt,
+                    temperature=min(temperature, 0.6),
+                    timeout=self.timeout,
+                ).strip()
+            except Exception as exc:
+                natural_output = f"[{self.role} ERROR] summary synthesis failed: {exc}"
+
+            if natural_output and not _extract_tool_json(natural_output):
+                last_non_json_output = natural_output
+                trace_list.append(
+                    {
+                        "timestamp": time.time(),
+                        "agent": self.role,
+                        "step": f"summary:{total_tool_calls}",
+                        "thought": "Generated final natural-language response after tool call.",
+                        "output": natural_output,
+                    }
+                )
+                LOGGER.info("[%s] Tool loop exit reason: produced post-tool natural-language response.", self.role)
+                return natural_output
+
+            if total_tool_calls >= max_total_tool_calls:
+                exit_reason = "max_tool_calls"
+                LOGGER.warning("Max tool calls reached for agent %s", self.role)
+                break
+
+        LOGGER.info("[%s] Tool loop exit reason: %s", self.role, exit_reason)
+        # After tool loop - force tool result into final answer
+        if last_tool_result_text and "error" not in last_tool_result_text.lower():
+            final_prompt = (
+                "Summarize this tool result as a direct answer to the user query.\n"
+                "Do not mention tools, JSON, or internal process.\n\n"
+                f"User query: {task}\n"
+                f"Result: {last_tool_result_text}"
+            )
+            try:
+                final_output = requests.post(
+                    f"{self.ollama_host}/api/generate",
+                    json={
+                        "model": self.summary_model,
+                        "prompt": final_prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.4}
+                    },
+                    timeout=20
+                ).json().get("response", "").strip()
+                if final_output:
+                    return final_output
+            except Exception as e:
+                LOGGER.warning(f"Final synthesis failed: {e}")
+
+        # Ultimate fallback
+        if last_tool_result_text and "error" in last_tool_result_text.lower():
+            try:
+                general_prompt = (
+                    "Tool failed, here's general info. "
+                    "Answer the user query with best-effort static knowledge, concise and clear.\n\n"
+                    f"User query: {task}\n"
+                    f"Failure details: {last_tool_result_text}"
+                )
+                general_output = _call_ollama(
+                    ollama_host=self.ollama_host,
+                    model=self.summary_model,
+                    prompt=general_prompt,
+                    temperature=0.5,
+                    timeout=20,
+                ).strip()
+                if general_output:
+                    return general_output
+            except Exception:
+                pass
+        return f"Current conditions: {last_tool_result_text}" if last_tool_result_text else "No response generated."
 
 
 def _run_agent_with_healing(
@@ -691,36 +835,86 @@ def _call_web_ai_api(user_message: str, history: List[Dict[str, str]], web_cfg: 
     return None
 
 
-# CHANGED: Gemini API integration via google-generativeai (preferred web route).
+# === Gemini fallback using CURRENT google-genai package (2026 API) ===
+try:
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    gemini_model = None
+    gemini_client = None
+    if gemini_api_key:
+        try:
+            # Preferred package path.
+            from google import genai as google_genai
+
+            # New google.genai client API (no configure()).
+            gemini_client = google_genai.Client(api_key=gemini_api_key)
+            gemini_model = "gemini-1.5-flash"
+            LOGGER.info("[Gemini] Initialized successfully with google.genai Client + gemini-1.5-flash")
+            print("[GEMINI STARTUP] Initialized via google.genai Client (model=gemini-1.5-flash)")
+        except Exception as primary_exc:
+            try:
+                # Legacy compatibility fallback.
+                import google.generativeai as google_genai_legacy
+
+                google_genai_legacy.configure(api_key=gemini_api_key)
+                gemini_model = google_genai_legacy.GenerativeModel("gemini-1.5-flash")
+                gemini_client = None
+                LOGGER.info("[Gemini] Initialized with legacy google.generativeai + gemini-1.5-flash")
+                print("[GEMINI STARTUP] Initialized via legacy google.generativeai (model=gemini-1.5-flash)")
+            except Exception as legacy_exc:
+                gemini_model = None
+                gemini_client = None
+                LOGGER.warning(
+                    "google-genai package import failed - Gemini fallback disabled. "
+                    "primary=%s legacy=%s",
+                    primary_exc,
+                    legacy_exc,
+                )
+                print(
+                    "[GEMINI STARTUP] Disabled. "
+                    f"primary={primary_exc} legacy={legacy_exc}"
+                )
+    else:
+        LOGGER.warning("GEMINI_API_KEY not set in .env - Gemini fallback disabled")
+        print("[GEMINI STARTUP] Disabled. GEMINI_API_KEY not set.")
+except Exception as e:
+    gemini_model = None
+    gemini_client = None
+    LOGGER.error(f"Gemini init failed: {str(e)}")
+    print(f"[GEMINI STARTUP] Init failed: {str(e)}")
+
+
 def _call_gemini_api(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[str, Any]) -> Optional[str]:
-    # Load from .env first, fallback to config.
-    api_key = os.getenv("GEMINI_API_KEY") or web_cfg.get("gemini_api_key") or web_cfg.get("api_key")
-    if not api_key:
+    if not gemini_model:
         return None
-    try:
-        import google.generativeai as genai
-    except Exception as exc:
-        LOGGER.warning("google-generativeai unavailable: %s", exc)
-        return None
-
-    model_name = web_cfg.get("gemini_model", "gemini-1.5-flash")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-
     history_text = _history_to_text(history, max_items=10)
     prompt = (
         "You are a web-enabled assistant. Provide accurate, up-to-date output when possible.\n\n"
         f"Recent conversation:\n{history_text}\n\n"
         f"User request:\n{user_message}"
     )
-    response = model.generate_content(prompt)
-    text = getattr(response, "text", "") or ""
-    return text.strip() or None
+    try:
+        if gemini_client is not None:
+            response = gemini_client.models.generate_content(model=gemini_model, contents=prompt)
+        else:
+            response = gemini_model.generate_content(prompt)
+        text = getattr(response, "text", "") or ""
+        if text.strip():
+            print(f"[DEBUG] Gemini response: {text[:200]}...")
+            return text.strip()
+        return None
+    except Exception as exc:
+        error_text = str(exc)
+        if "404" in error_text or "429" in error_text:
+            LOGGER.warning("Gemini API returned %s; falling back to local path.", error_text)
+            return None
+        LOGGER.warning("Gemini API call failed: %s", error_text)
+        return None
 
 
 def _call_web_ai_selenium(user_message: str, web_cfg: Dict[str, Any]) -> Optional[str]:
     selenium_cfg = web_cfg.get("selenium", {})
-    if selenium_cfg.get("enabled", True) is False:
+    if selenium_cfg.get("enabled", False) is False:
+        LOGGER.info("Selenium fallback disabled: ChromeDriver not configured")
         return None
 
     try:
@@ -754,7 +948,11 @@ def _call_web_ai_selenium(user_message: str, web_cfg: Dict[str, Any]) -> Optiona
 
     driver = None
     try:
-        driver = webdriver.Chrome(options=options)
+        try:
+            driver = webdriver.Chrome(options=options)
+        except Exception as exc:
+            LOGGER.warning("Selenium fallback disabled: ChromeDriver not configured (%s)", exc)
+            return None
         wait = WebDriverWait(driver, timeout_seconds)
         driver.get(url)
 
@@ -801,20 +999,13 @@ def _try_web_ai(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[
         if not (preferred_for & categories):
             return None
 
-    # CHANGED: prefer Gemini API first when configured.
+    # Fixed: prefer Gemini API first, then Selenium, then local writer fallback.
     try:
         gemini_response = _call_gemini_api(user_message, history, web_cfg)
         if gemini_response:
             return gemini_response
     except Exception as exc:
         LOGGER.warning("Gemini API fallback failed: %s", exc)
-
-    try:
-        api_response = _call_web_ai_api(user_message, history, web_cfg)
-        if api_response:
-            return api_response
-    except Exception as exc:
-        LOGGER.warning("Web API fallback failed: %s", exc)
 
     try:
         selenium_response = _call_web_ai_selenium(user_message, web_cfg)
@@ -876,15 +1067,15 @@ def build_orchestrator_runner(config: Dict[str, Any]):
         history_keep_recent = int(history_cfg.get("keep_recent", 8))
 
         agents = {
-            "CEO": Agent("CEO", consult_model, ollama_host),
-            "CTO": Agent("CTO", consult_model, ollama_host),
-            "Programmer": Agent("Programmer", writer_model, ollama_host),
-            "Tester": Agent("Tester", consult_model, ollama_host),
+            "CEO": Agent("CEO", consult_model, ollama_host, summary_model=writer_model),
+            "CTO": Agent("CTO", consult_model, ollama_host, summary_model=writer_model),
+            "Programmer": Agent("Programmer", writer_model, ollama_host, summary_model=writer_model),
+            "Tester": Agent("Tester", consult_model, ollama_host, summary_model=writer_model),
             # CHANGED: ToolAdvisor agent for up-front tool planning.
-            "ToolAdvisor": Agent("ToolAdvisor", consult_model, ollama_host),
-            "DirectWriter": Agent("DirectWriter", writer_model, ollama_host),
+            "ToolAdvisor": Agent("ToolAdvisor", consult_model, ollama_host, summary_model=writer_model),
+            "DirectWriter": Agent("DirectWriter", writer_model, ollama_host, summary_model=writer_model),
         }
-        healer = Agent("Error Healer", consult_model, ollama_host)
+        healer = Agent("Error Healer", consult_model, ollama_host, summary_model=writer_model)
 
         def execute_swarm_once(
             prompt_text: str,
@@ -935,6 +1126,10 @@ def build_orchestrator_runner(config: Dict[str, Any]):
 
             trace: List[Dict[str, Any]] = []
             use_swarm = _intent_check(user_message, chatdev_enabled, ollama_host, consult_model)
+            # Fixed: force tool/swarm mode on explicit user instruction.
+            explicit_tool_request = ("use tools" in user_message.lower()) or ("tool" in user_message.lower())
+            if explicit_tool_request:
+                use_swarm = True
             direct_tool_bias = _should_offer_direct_tools(user_message)
             borderline_intent = (not use_swarm) and (_is_complex_query(user_message) or direct_tool_bias)
 

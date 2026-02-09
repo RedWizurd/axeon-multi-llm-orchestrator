@@ -4,7 +4,8 @@ A multi-LLM orchestrator using Ollama + FastAPI, now with configurable parallel 
 
 ## Setup
 1. Install dependencies:
-   - `pip install fastapi uvicorn requests pydantic python-dotenv`
+   - `pip uninstall -y google-generativeai` (if previously installed)
+   - `pip install fastapi uvicorn requests pydantic python-dotenv google-genai`
    - Optional for web fallback scraping: `pip install selenium`
 2. Run Ollama and pull models:
    - `ollama serve`
