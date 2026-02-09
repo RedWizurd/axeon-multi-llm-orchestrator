@@ -10,7 +10,7 @@
     }
   },
   "swarm_mode": "sequential",
-  "max_iterations": 1,
+  "max_iterations": 3,
   "include_swarm_trace": false,
   "history": {
     "max_chars": 9000,
@@ -29,11 +29,14 @@
     "preferred_for": [
       "creative",
       "research",
-      "current_events"
+      "current_events",
+      "weather",
+      "news",
+      "real-time"
     ],
     "provider": "gemini",
     "api_url": null,
-    "api_key": null,
+    "gemini_model": "gemini-1.5-flash",
     "timeout_seconds": 45,
     "selenium": {
       "enabled": true,
@@ -46,9 +49,9 @@
       "chrome_user_data_dir": null
     }
   },
+  "_security_note": "Sensitive keys now loaded from .env - see .env.example",
   "rate_limit": {
     "enabled": false,
     "requests_per_min": 60
-  },
-  "api_key": null
+  }
 }

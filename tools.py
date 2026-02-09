@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -11,11 +12,15 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
+from dotenv import load_dotenv
 
 MAX_FILE_READ_BYTES = 200_000
 MAX_FILE_WRITE_BYTES = 200_000
 MAX_CODE_CHARS = 4000
 DEFAULT_TIMEOUT_SECONDS = 12
+
+# Load from .env first, fallback to config.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
     "web_search": "Search the web and return top snippets. Args: {query: str}",
@@ -383,10 +388,15 @@ print(json.dumps(result))
             "url": url,
             "timeout": max(1, min(timeout_seconds, 20)),
         }
+        payload_data = data or {}
+        # Load from .env first, fallback to config.
+        openweather_api_key = os.getenv("OPENWEATHER_API_KEY")
+        if "openweathermap.org" in url and openweather_api_key and "appid" not in payload_data:
+            payload_data = {**payload_data, "appid": openweather_api_key}
         if method == "GET":
-            kwargs["params"] = data or {}
+            kwargs["params"] = payload_data
         elif data is not None:
-            kwargs["json"] = data
+            kwargs["json"] = payload_data
 
         response = requests.request(**kwargs)
         content_type = response.headers.get("content-type", "")

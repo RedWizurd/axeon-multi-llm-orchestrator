@@ -4,7 +4,7 @@ A multi-LLM orchestrator using Ollama + FastAPI, now with configurable parallel 
 
 ## Setup
 1. Install dependencies:
-   - `pip install fastapi uvicorn requests pydantic`
+   - `pip install fastapi uvicorn requests pydantic python-dotenv`
    - Optional for web fallback scraping: `pip install selenium`
 2. Run Ollama and pull models:
    - `ollama serve`
@@ -13,6 +13,17 @@ A multi-LLM orchestrator using Ollama + FastAPI, now with configurable parallel 
 3. Configure `config.json`.
 4. Run server:
    - `python axeon_server.py`
+
+## Security
+API keys are loaded from `.env` (never commit this file).
+Copy `.env.example` to `.env` and fill in your keys.
+
+Example:
+```bash
+GEMINI_API_KEY=AIza...
+OPENWEATHER_API_KEY=abc123...
+AXEON_API_KEY=mysecret
+```
 
 ## New Config Options
 - `swarm_mode`: `"sequential"` (safe default) or `"parallel"`.
@@ -23,7 +34,7 @@ A multi-LLM orchestrator using Ollama + FastAPI, now with configurable parallel 
 - `web_fallback.enabled`, `web_fallback.preferred_for`: route matching tasks to web AI first, fallback local on failure.
 - `web_fallback.api_url` / `web_fallback.selenium.*`: API-first or Selenium scraping fallback options.
 - `rate_limit.enabled`, `rate_limit.requests_per_min`: per-IP request limits.
-- `api_key`: optional bearer token auth (`Authorization: Bearer <key>`).
+- `AXEON_API_KEY` (in `.env`): optional bearer token auth (`Authorization: Bearer <key>`).
 
 ## Endpoints
 - `GET /health`

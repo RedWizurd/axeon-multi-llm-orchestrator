@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -13,6 +14,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from dotenv import load_dotenv
 
 from tools import ToolExecutor
 
@@ -74,6 +76,45 @@ def _compress_history(
 
     summary = "Earlier conversation summary:\n" + "\n".join(summary_lines)
     return [{"role": "system", "content": summary}] + recent
+
+
+# CHANGED: model-assisted history summarization trigger helpers.
+def _estimate_tokens_for_messages(messages: List[Dict[str, str]]) -> int:
+    total_words = sum(len((m.get("content") or "").split()) for m in messages)
+    return int(total_words * 1.3) + 20
+
+
+def _summarize_history_with_consult_model(
+    history: List[Dict[str, str]],
+    ollama_host: str,
+    consult_model: str,
+    temperature: float = 0.2,
+) -> List[Dict[str, str]]:
+    if not history:
+        return []
+    if len(history) <= 5:
+        return history
+
+    older = history[:-5]
+    recent = history[-5:]
+    summary_prompt = (
+        "Summarize the key points of this conversation history in 300-500 tokens, "
+        "keeping recent messages intact:\n\n"
+        f"{json.dumps(older, ensure_ascii=False)}"
+    )
+    try:
+        summary = _call_ollama(
+            ollama_host=ollama_host,
+            model=consult_model,
+            prompt=summary_prompt,
+            temperature=temperature,
+            timeout=45,
+        )
+        if summary.strip():
+            return [{"role": "system", "content": f"Summarized history:\n{summary.strip()}"}] + recent
+    except Exception as exc:
+        LOGGER.warning("History summarization via consult model failed: %s", exc)
+    return history
 
 
 def _history_to_text(history: List[Dict[str, str]], max_items: int = 20) -> str:
@@ -161,19 +202,31 @@ def _is_complex_query(message: str) -> bool:
 
 def _is_self_improvement_request(message: str) -> bool:
     low = (message or "").lower()
-    keywords = ["improve", "optimize", "refactor", "iterate", "rewrite", "patch", "diff"]
+    # CHANGED: explicit self-improvement trigger phrases.
+    keywords = ["self-improve", "upgrade yourself", "axeon 2.0", "improve your code"]
     return any(word in low for word in keywords)
 
 
 def _should_offer_direct_tools(message: str) -> bool:
     low = (message or "").lower()
+    # CHANGED: broader direct-tool trigger list for aggressive tool availability.
     triggers = [
         "calculate",
         "compute",
         "math",
+        "use tools",
+        "tool",
         "search",
+        "fetch",
+        "current",
+        "now",
+        "live",
+        "real-time",
         "look up",
         "latest",
+        "weather",
+        "news",
+        "external data",
         "read file",
         "write file",
         "api",
@@ -185,10 +238,14 @@ def _should_offer_direct_tools(message: str) -> bool:
 
 def _detect_categories(message: str) -> set[str]:
     low = (message or "").lower()
+    # CHANGED: expanded routing categories for web-fallback matching.
     category_keywords = {
         "creative": ["story", "poem", "creative", "brainstorm", "tagline", "script"],
         "research": ["research", "compare", "sources", "citations", "investigate"],
         "current_events": ["today", "latest", "news", "current", "this week", "breaking"],
+        "weather": ["weather", "forecast", "temperature", "rain", "snow", "humidity"],
+        "news": ["news", "headline", "breaking", "current events"],
+        "real-time": ["live", "now", "real-time", "currently", "today"],
     }
     hits = set()
     for category, keywords in category_keywords.items():
@@ -209,6 +266,9 @@ def get_recent_traces(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def load_config(config_path: str = "config.json") -> Dict[str, Any]:
+    # Load from .env first, fallback to config.
+    base_dir = Path(__file__).resolve().parent
+    load_dotenv(base_dir / ".env")
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -560,9 +620,31 @@ def _intent_check(
     if not chatdev_enabled:
         return False
 
+    low = (user_message or "").lower()
+    # CHANGED: force-intent keywords requested by user.
+    force_keywords = [
+        "use tools",
+        "tool",
+        "current",
+        "live",
+        "now",
+        "fetch",
+        "search",
+        "external data",
+        "real-time",
+        "weather",
+        "news",
+        "api",
+    ]
+    if any(keyword in low for keyword in force_keywords):
+        return True
+    if _is_self_improvement_request(user_message):
+        return True
+
     intent_prompt = (
         "Is this query likely to benefit from a multi-agent breakdown "
-        "(software development, debugging, complex planning, research, multi-step reasoning)? "
+        "(software development, debugging, complex planning, research, multi-step reasoning, "
+        "tool usage, current/live/real-time info, weather/news/API lookups, or external data fetch)? "
         "Answer only 'yes' or 'no'.\n\n"
         f"Query: {user_message}"
     )
@@ -607,6 +689,33 @@ def _call_web_ai_api(user_message: str, history: List[Dict[str, str]], web_cfg: 
     if isinstance(response.text, str) and response.text.strip():
         return response.text.strip()
     return None
+
+
+# CHANGED: Gemini API integration via google-generativeai (preferred web route).
+def _call_gemini_api(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[str, Any]) -> Optional[str]:
+    # Load from .env first, fallback to config.
+    api_key = os.getenv("GEMINI_API_KEY") or web_cfg.get("gemini_api_key") or web_cfg.get("api_key")
+    if not api_key:
+        return None
+    try:
+        import google.generativeai as genai
+    except Exception as exc:
+        LOGGER.warning("google-generativeai unavailable: %s", exc)
+        return None
+
+    model_name = web_cfg.get("gemini_model", "gemini-1.5-flash")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    history_text = _history_to_text(history, max_items=10)
+    prompt = (
+        "You are a web-enabled assistant. Provide accurate, up-to-date output when possible.\n\n"
+        f"Recent conversation:\n{history_text}\n\n"
+        f"User request:\n{user_message}"
+    )
+    response = model.generate_content(prompt)
+    text = getattr(response, "text", "") or ""
+    return text.strip() or None
 
 
 def _call_web_ai_selenium(user_message: str, web_cfg: Dict[str, Any]) -> Optional[str]:
@@ -692,6 +801,14 @@ def _try_web_ai(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[
         if not (preferred_for & categories):
             return None
 
+    # CHANGED: prefer Gemini API first when configured.
+    try:
+        gemini_response = _call_gemini_api(user_message, history, web_cfg)
+        if gemini_response:
+            return gemini_response
+    except Exception as exc:
+        LOGGER.warning("Gemini API fallback failed: %s", exc)
+
     try:
         api_response = _call_web_ai_api(user_message, history, web_cfg)
         if api_response:
@@ -738,9 +855,22 @@ def build_orchestrator_runner(config: Dict[str, Any]):
         if swarm_mode not in {"sequential", "parallel"}:
             swarm_mode = "sequential"
 
-        web_cfg = config.get("web_fallback", {})
+        web_cfg = dict(config.get("web_fallback", {}))
+        # Load from .env first, fallback to config.
+        gemini_api_key = os.getenv("GEMINI_API_KEY") or web_cfg.get("gemini_api_key") or config.get("gemini_api_key")
+        openweather_api_key = os.getenv("OPENWEATHER_API_KEY") or config.get("openweather_api_key")
+        web_cfg["gemini_api_key"] = gemini_api_key
+        if openweather_api_key:
+            web_cfg["openweather_api_key"] = openweather_api_key
 
-        max_iterations = max(1, int(config.get("max_iterations", 1)))
+        if web_cfg.get("enabled", False) and not gemini_api_key:
+            LOGGER.warning(
+                "Web fallback is enabled but GEMINI_API_KEY is not set; "
+                "Gemini path disabled, local fallback remains active."
+            )
+
+        # CHANGED: default self-improvement iteration count now 3.
+        max_iterations = max(1, int(config.get("max_iterations", 3)))
         history_cfg = config.get("history", {})
         history_max_chars = int(history_cfg.get("max_chars", 9000))
         history_keep_recent = int(history_cfg.get("keep_recent", 8))
@@ -750,6 +880,8 @@ def build_orchestrator_runner(config: Dict[str, Any]):
             "CTO": Agent("CTO", consult_model, ollama_host),
             "Programmer": Agent("Programmer", writer_model, ollama_host),
             "Tester": Agent("Tester", consult_model, ollama_host),
+            # CHANGED: ToolAdvisor agent for up-front tool planning.
+            "ToolAdvisor": Agent("ToolAdvisor", consult_model, ollama_host),
             "DirectWriter": Agent("DirectWriter", writer_model, ollama_host),
         }
         healer = Agent("Error Healer", consult_model, ollama_host)
@@ -792,12 +924,23 @@ def build_orchestrator_runner(config: Dict[str, Any]):
                 max_chars=history_max_chars,
                 keep_recent=history_keep_recent,
             )
+            # CHANGED: consult-model summarization when context grows past ~6000 tokens.
+            if _estimate_tokens_for_messages(compact_history) > 6000:
+                compact_history = _summarize_history_with_consult_model(
+                    compact_history,
+                    ollama_host=ollama_host,
+                    consult_model=consult_model,
+                    temperature=min(temperature, 0.3),
+                )
 
             trace: List[Dict[str, Any]] = []
             use_swarm = _intent_check(user_message, chatdev_enabled, ollama_host, consult_model)
+            direct_tool_bias = _should_offer_direct_tools(user_message)
+            borderline_intent = (not use_swarm) and (_is_complex_query(user_message) or direct_tool_bias)
 
             used_web = False
-            if use_swarm and web_cfg.get("enabled", False):
+            web_preferred_match = bool(set(web_cfg.get("preferred_for", [])) & _detect_categories(user_message))
+            if use_swarm and web_cfg.get("enabled", False) and web_preferred_match:
                 web_output = _try_web_ai(user_message, compact_history, web_cfg)
                 if web_output:
                     used_web = True
@@ -830,19 +973,83 @@ def build_orchestrator_runner(config: Dict[str, Any]):
                         }
                     )
                     return result
+                trace.append(
+                    {
+                        "timestamp": time.time(),
+                        "agent": "WebFallback",
+                        "step": "web_ai_failed",
+                        "thought": "Preferred web route failed, falling back to local writer model.",
+                        "output": "Gemini/web fallback unavailable or failed.",
+                    }
+                )
+                # CHANGED: explicit fallback to local writer model when preferred web route fails.
+                direct_trace: List[Dict[str, Any]] = []
+                direct_web_response = agents["DirectWriter"].act(
+                    task=f"Respond directly and clearly.\n\nUser request:\n{user_message}",
+                    history=compact_history + [{"role": "user", "content": user_message}],
+                    temperature=temperature,
+                    tool_executor=tool_executor if direct_tool_bias else None,
+                    max_tool_calls=min(max_tool_calls, 3),
+                    trace=direct_trace,
+                )
+                trace.extend(direct_trace)
+                result = TurnResult(
+                    response=direct_web_response or "No response generated.",
+                    swarm_trace=trace if include_trace else [],
+                    used_swarm=False,
+                    used_web=False,
+                    mode="direct_web_fallback",
+                )
+                _append_run_trace(
+                    {
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "mode": result.mode,
+                        "used_swarm": result.used_swarm,
+                        "used_web": result.used_web,
+                        "input": _truncate_text(user_message, 500),
+                        "response": _truncate_text(result.response, 1200),
+                        "swarm_trace": trace,
+                    }
+                )
+                return result
 
             if use_swarm:
-                response, swarm_trace = execute_swarm_once(user_message, compact_history, temperature)
+                # CHANGED: ToolAdvisor runs first to suggest tools/workflow before swarm execution.
+                advisor_task = (
+                    "Decide whether tools are needed. If yes, reply with tool JSON. "
+                    "Otherwise provide a brief plan for CEO/CTO/Programmer/Tester."
+                    f"\n\nUser request:\n{user_message}"
+                )
+                advisor_trace: List[Dict[str, Any]] = []
+                advisor_output = agents["ToolAdvisor"].act(
+                    task=advisor_task,
+                    history=compact_history + [{"role": "user", "content": user_message}],
+                    temperature=min(temperature, 0.5),
+                    tool_executor=tool_executor,
+                    max_tool_calls=max_tool_calls,
+                    trace=advisor_trace,
+                )
+                trace.extend(advisor_trace)
+                swarm_prompt = user_message
+                if advisor_output.strip():
+                    swarm_prompt = (
+                        f"{user_message}\n\nToolAdvisor Guidance:\n{advisor_output}\n\n"
+                        "Use the guidance above where useful."
+                    )
+
+                response, swarm_trace = execute_swarm_once(swarm_prompt, compact_history, temperature)
                 trace.extend(swarm_trace)
 
-                if max_iterations > 1 and _is_self_improvement_request(user_message):
+                if _is_self_improvement_request(user_message):
                     iterative_response = response
                     for iteration in range(2, max_iterations + 1):
                         if iterative_response.strip().lower().startswith("done"):
                             break
 
                         refine_prompt = (
-                            f"Iteration {iteration}/{max_iterations}. Improve the previous output. "
+                            f"Iteration {iteration}/{max_iterations}. Swarm review the previous output, "
+                            "suggest concrete changes, and have Programmer produce a diff/patch. "
                             "If no further improvements are needed, respond with DONE.\n\n"
                             f"Original user request:\n{user_message}\n\n"
                             f"Previous output:\n{iterative_response}"
@@ -875,14 +1082,15 @@ def build_orchestrator_runner(config: Dict[str, Any]):
                     f"User request:\n{user_message}"
                 )
 
-                direct_tools_enabled = bool(tool_executor and _should_offer_direct_tools(user_message))
+                # CHANGED: allow aggressive tool loop in direct mode for explicit/borderline tool intents.
+                direct_tools_enabled = bool(tool_executor and (direct_tool_bias or borderline_intent))
                 direct_trace: List[Dict[str, Any]] = []
                 response = agents["DirectWriter"].act(
                     task=direct_task,
                     history=compact_history + [{"role": "user", "content": user_message}],
                     temperature=temperature,
                     tool_executor=tool_executor if direct_tools_enabled else None,
-                    max_tool_calls=max_tool_calls,
+                    max_tool_calls=min(max_tool_calls, 3),
                     trace=direct_trace,
                 )
                 trace.extend(direct_trace)

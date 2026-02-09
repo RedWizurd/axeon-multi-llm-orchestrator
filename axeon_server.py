@@ -14,6 +14,7 @@ from threading import Lock
 from typing import Any, Optional
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +36,9 @@ MAX_INPUT_CHARS = 12000
 ENABLE_CORS = True
 ENABLE_SWAGGER = True
 PORT = int(os.getenv("PORT", "8000"))
+
+# Load from .env first, fallback to config.
+load_dotenv(BASE_DIR / ".env")
 
 _RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 _RATE_LIMIT_LOCK = Lock()
@@ -99,15 +103,22 @@ def get_client_ip(request: Request) -> str:
 
 
 def enforce_api_key(config: dict[str, Any], authorization: Optional[str]) -> None:
-    expected_key = config.get("api_key")
+    # Load from .env first, fallback to config.
+    expected_key = os.getenv("AXEON_API_KEY") or config.get("api_key")
+    auth_enabled = bool(config.get("api_auth", {}).get("enabled", False) or expected_key)
+    if not auth_enabled:
+        return
     if not expected_key:
+        LOGGER.warning("API auth enabled but AXEON_API_KEY is missing; allowing requests (dev fallback).")
         return
 
     if not authorization or not authorization.startswith("Bearer "):
+        LOGGER.warning("API key violation: missing/invalid Authorization header.")
         raise HTTPException(status_code=401, detail="Missing API key.")
 
     provided = authorization.split(" ", 1)[1].strip()
     if provided != expected_key:
+        LOGGER.warning("API key violation: provided bearer token mismatch.")
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
@@ -128,6 +139,12 @@ def enforce_rate_limit(config: dict[str, Any], ip: str) -> None:
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
         if len(bucket) >= requests_per_min:
+            LOGGER.warning(
+                "Rate limit violation: ip=%s limit=%s/min current=%s",
+                ip,
+                requests_per_min,
+                len(bucket),
+            )
             raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again in a minute.")
         bucket.append(now)
 
