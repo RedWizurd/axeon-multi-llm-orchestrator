@@ -22,6 +22,7 @@ LOGGER = logging.getLogger("axeon_orchestrator")
 
 _RECENT_TRACES: deque[Dict[str, Any]] = deque(maxlen=300)
 _TRACE_LOCK = Lock()
+_GEMINI_BACKOFF_UNTIL = 0.0
 
 
 @dataclass
@@ -836,6 +837,36 @@ def _call_web_ai_api(user_message: str, history: List[Dict[str, str]], web_cfg: 
 
 
 # === Gemini fallback using CURRENT google-genai package (2026 API) ===
+def _discover_gemini_model(api_key: str, preferred_model: str = "gemini-1.5-flash") -> str:
+    """Resolve a generateContent-capable model for the current API key."""
+    try:
+        resp = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        available: List[str] = []
+        for item in data.get("models", []):
+            methods = item.get("supportedGenerationMethods", []) or []
+            if "generateContent" in methods:
+                name = (item.get("name") or "").replace("models/", "")
+                if name:
+                    available.append(name)
+        if not available:
+            return preferred_model
+        if preferred_model in available:
+            return preferred_model
+        for candidate in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
+            if candidate in available:
+                return candidate
+        return available[0]
+    except Exception as exc:
+        LOGGER.warning("Gemini model discovery failed: %s", exc)
+        return preferred_model
+
+
 try:
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     gemini_model = None
@@ -847,9 +878,9 @@ try:
 
             # New google.genai client API (no configure()).
             gemini_client = google_genai.Client(api_key=gemini_api_key)
-            gemini_model = "gemini-1.5-flash"
-            LOGGER.info("[Gemini] Initialized successfully with google.genai Client + gemini-1.5-flash")
-            print("[GEMINI STARTUP] Initialized via google.genai Client (model=gemini-1.5-flash)")
+            gemini_model = _discover_gemini_model(gemini_api_key, preferred_model="gemini-1.5-flash")
+            LOGGER.info("[Gemini] Initialized successfully with google.genai Client + %s", gemini_model)
+            print(f"[GEMINI STARTUP] Initialized via google.genai Client (model={gemini_model})")
         except Exception as primary_exc:
             try:
                 # Legacy compatibility fallback.
@@ -884,7 +915,12 @@ except Exception as e:
 
 
 def _call_gemini_api(user_message: str, history: List[Dict[str, str]], web_cfg: Dict[str, Any]) -> Optional[str]:
+    global _GEMINI_BACKOFF_UNTIL
     if not gemini_model:
+        return None
+    now = time.time()
+    if now < _GEMINI_BACKOFF_UNTIL:
+        LOGGER.info("Gemini backoff active for %.1fs; skipping Gemini call.", _GEMINI_BACKOFF_UNTIL - now)
         return None
     history_text = _history_to_text(history, max_items=10)
     prompt = (
@@ -904,8 +940,48 @@ def _call_gemini_api(user_message: str, history: List[Dict[str, str]], web_cfg: 
         return None
     except Exception as exc:
         error_text = str(exc)
-        if "404" in error_text or "429" in error_text:
+        if "404" in error_text and gemini_client is not None and gemini_api_key:
+            # One retry with discovered model in case current model is not enabled for this key.
+            try:
+                retry_model = _discover_gemini_model(gemini_api_key, preferred_model=gemini_model or "gemini-1.5-flash")
+                if retry_model != gemini_model:
+                    LOGGER.warning("Gemini model %s unavailable; retrying with %s", gemini_model, retry_model)
+                    response = gemini_client.models.generate_content(model=retry_model, contents=prompt)
+                    text = getattr(response, "text", "") or ""
+                    if text.strip():
+                        return text.strip()
+            except Exception as retry_exc:
+                LOGGER.warning("Gemini retry failed: %s", retry_exc)
             LOGGER.warning("Gemini API returned %s; falling back to local path.", error_text)
+            return None
+        if "429" in error_text or "resource_exhausted" in error_text.lower():
+            retry_seconds = 60.0
+            # Handle common retry formats:
+            # - "retry in 30.52s"
+            # - "retryDelay': '30s'"
+            # - "retryDelay: 30s"
+            retry_patterns = [
+                r"retry\s+in\s+(\d+(?:\.\d+)?)s?",
+                r"retryDelay['\":\s]+(\d+(?:\.\d+)?)s?",
+            ]
+            for pattern in retry_patterns:
+                match = re.search(pattern, error_text, flags=re.IGNORECASE)
+                if match:
+                    try:
+                        retry_seconds = float(match.group(1))
+                        break
+                    except Exception:
+                        retry_seconds = 60.0
+
+            # Quota limit 0 usually means no usable Gemini quota right now.
+            # Use a much longer cooldown to avoid spamming the API and logs.
+            lower_error = error_text.lower()
+            if "quota exceeded" in lower_error and "limit: 0" in lower_error:
+                retry_seconds = max(retry_seconds, 3600.0)
+
+            _GEMINI_BACKOFF_UNTIL = time.time() + max(30.0, min(retry_seconds, 21600.0))
+            LOGGER.warning("Gemini API returned 429/RESOURCE_EXHAUSTED; falling back to local path.")
+            LOGGER.warning("Gemini cooldown enabled for %.1fs.", _GEMINI_BACKOFF_UNTIL - time.time())
             return None
         LOGGER.warning("Gemini API call failed: %s", error_text)
         return None
@@ -914,7 +990,7 @@ def _call_gemini_api(user_message: str, history: List[Dict[str, str]], web_cfg: 
 def _call_web_ai_selenium(user_message: str, web_cfg: Dict[str, Any]) -> Optional[str]:
     selenium_cfg = web_cfg.get("selenium", {})
     if selenium_cfg.get("enabled", False) is False:
-        LOGGER.info("Selenium fallback disabled: ChromeDriver not configured")
+        LOGGER.info("Selenium fallback disabled by config (web_fallback.selenium.enabled=false)")
         return None
 
     try:
@@ -951,7 +1027,7 @@ def _call_web_ai_selenium(user_message: str, web_cfg: Dict[str, Any]) -> Optiona
         try:
             driver = webdriver.Chrome(options=options)
         except Exception as exc:
-            LOGGER.warning("Selenium fallback disabled: ChromeDriver not configured (%s)", exc)
+            LOGGER.warning("Selenium fallback unavailable: ChromeDriver not configured (%s)", exc)
             return None
         wait = WebDriverWait(driver, timeout_seconds)
         driver.get(url)
